@@ -426,6 +426,7 @@ struct smb_variant {
  * @usb_in_i_chan:	USB_IN current measurement channel
  * @usb_in_v_chan:	USB_IN voltage measurement channel
  * @vbat_chan:		Battery voltage (VBAT_SNS) measurement channel
+ * @bat_therm_chan:	Battery thermistor (BAT_THERM) measurement channel
  * @chg_psy:		Charger power supply instance
  * @batt_psy:		Battery (fuel-gauge) power supply instance
  */
@@ -444,6 +445,7 @@ struct smb_chip {
 	struct iio_channel *usb_in_i_chan;
 	struct iio_channel *usb_in_v_chan;
 	struct iio_channel *vbat_chan;
+	struct iio_channel *bat_therm_chan;
 
 	struct power_supply *chg_psy;
 	struct power_supply *batt_psy;
@@ -859,6 +861,7 @@ static enum power_supply_property smb_batt_properties[] = {
 	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_CAPACITY,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_TEMP,
 };
 
 static int smb_get_vbat(struct smb_chip *chip, int *val)
@@ -868,6 +871,22 @@ static int smb_get_vbat(struct smb_chip *chip, int *val)
 
 	/* ADC5 processed voltage channels return microvolts */
 	return iio_read_channel_processed(chip->vbat_chan, val);
+}
+
+static int smb_get_batt_temp(struct smb_chip *chip, int *val)
+{
+	int temp, rc;
+
+	if (IS_ERR_OR_NULL(chip->bat_therm_chan))
+		return -ENODATA;
+
+	/* The ADC returns millidegrees C, the power supply class decidegrees */
+	rc = iio_read_channel_processed(chip->bat_therm_chan, &temp);
+	if (rc < 0)
+		return rc;
+
+	*val = temp / 100;
+	return 0;
 }
 
 static int smb_get_batt_capacity(struct smb_chip *chip, int *val)
@@ -916,6 +935,8 @@ static int smb_batt_get_property(struct power_supply *psy,
 		return smb_get_batt_capacity(chip, &val->intval);
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
 		return smb_get_vbat(chip, &val->intval);
+	case POWER_SUPPLY_PROP_TEMP:
+		return smb_get_batt_temp(chip, &val->intval);
 	default:
 		dev_err(chip->dev, "invalid battery property: %d\n", psp);
 		return -EINVAL;
@@ -1245,6 +1266,18 @@ static int smb_probe(struct platform_device *pdev)
 		if (rc == -EPROBE_DEFER)
 			return rc;
 		chip->vbat_chan = NULL;
+	}
+
+	/*
+	 * BAT_THERM is optional in the same way: only boards that route the
+	 * pack thermistor to the PMIC can report a battery temperature.
+	 */
+	chip->bat_therm_chan = devm_iio_channel_get(chip->dev, "bat_therm");
+	if (IS_ERR(chip->bat_therm_chan)) {
+		rc = PTR_ERR(chip->bat_therm_chan);
+		if (rc == -EPROBE_DEFER)
+			return rc;
+		chip->bat_therm_chan = NULL;
 	}
 
 	rc = smb_init_hw(chip);
