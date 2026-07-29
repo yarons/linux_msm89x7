@@ -1551,17 +1551,22 @@ static int smb_init_cooling(struct smb_chip *chip)
 		return dev_err_probe(chip->dev, rc,
 				     "Couldn't read the fast-charge current\n");
 
-	if (chip->thermal_mitigation_ua[0] > fcc_ua)
-		return dev_err_probe(chip->dev, -EINVAL,
-				     "qcom,thermal-mitigation starts at %u uA, above the fast-charge current %u\n",
-				     chip->thermal_mitigation_ua[0], fcc_ua);
-
 	for (i = 1; i < count; i++)
 		if (chip->thermal_mitigation_ua[i] >
 		    chip->thermal_mitigation_ua[i - 1])
 			return dev_err_probe(chip->dev, -EINVAL,
 					     "qcom,thermal-mitigation must not increase (state %d)\n",
 					     i);
+
+	/*
+	 * Mitigation may only ever reduce. The table is written for the current
+	 * the board expects to charge at, and the charger may be running below
+	 * that - on the init-sequence default, because the fitted battery could
+	 * not be identified - in which case a state must not raise it back up.
+	 */
+	for (i = 0; i < count; i++)
+		chip->thermal_mitigation_ua[i] =
+			min(chip->thermal_mitigation_ua[i], fcc_ua);
 
 	chip->thermal_levels = count;
 
