@@ -65,8 +65,10 @@
 
 			io-channels = <&pmi632_adc ADC5_USB_IN_I>,
 				      <&pmi632_adc ADC5_USB_IN_V_16>,
-				      <&pmi632_adc ADC5_VBAT_SNS>;
-			io-channel-names = "usbin_i", "usbin_v", "vbat";
+				      <&pmi632_adc ADC5_VBAT_SNS>,
+				      <&pmi632_adc ADC5_BAT_THERM_100K_PU>;
+			io-channel-names = "usbin_i", "usbin_v", "vbat",
+					   "bat_therm";
 
 			status = "disabled";
 		};
@@ -144,6 +146,14 @@
 				reg = <ADC5_CHG_TEMP>;
 				qcom,pre-scaling = <1 1>;
 				label = "chg_temp";
+			};
+
+			channel@4a {
+				reg = <ADC5_BAT_THERM_100K_PU>;
+				qcom,hw-settle-time = <200>;
+				qcom,pre-scaling = <1 1>;
+				qcom,ratiometric;
+				label = "bat_therm";
 			};
 
 			channel@4b {
