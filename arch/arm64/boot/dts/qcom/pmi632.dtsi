@@ -66,9 +66,10 @@
 			io-channels = <&pmi632_adc ADC5_USB_IN_I>,
 				      <&pmi632_adc ADC5_USB_IN_V_16>,
 				      <&pmi632_adc ADC5_VBAT_SNS>,
-				      <&pmi632_adc ADC5_BAT_THERM_100K_PU>;
+				      <&pmi632_adc ADC5_BAT_THERM_100K_PU>,
+				      <&pmi632_adc ADC5_BAT_ID_100K_PU>;
 			io-channel-names = "usbin_i", "usbin_v", "vbat",
-					   "bat_therm";
+					   "bat_therm", "bat_id";
 
 			#cooling-cells = <2>;
 
