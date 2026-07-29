@@ -402,6 +402,11 @@ struct smb_init_register {
  *			(0x600 = MISC on SMB2, 0x100 = DCDC on SMB5)
  * @current_scale_ua:	uA per LSB of the FCC / ICL registers
  *			(25000 on SMB2/pmi8998, 50000 on SMB5/pmi632)
+ * @fcc_max_ua:		Highest fast-charge current a monitored-battery may ask
+ *			for on this generation. This is a fire-hazard limit,
+ *			not a hardware one: raising it for a generation means
+ *			someone has charged a board of that generation at the
+ *			new current and watched the temperatures
  * @float_base_uv:	Float-voltage register value 0 corresponds to this voltage
  * @float_step_uv:	uV per LSB of FLOAT_VOLTAGE_CFG
  * @ov_bit:		BAT_OV (overvoltage) bit within BATTERY_CHARGER_STATUS_2
@@ -421,6 +426,7 @@ struct smb_variant {
 	const char *name;
 	u16 status_base;
 	u32 current_scale_ua;
+	u32 fcc_max_ua;
 	u32 float_base_uv;
 	u32 float_step_uv;
 	u8 ov_bit;
@@ -1114,7 +1120,8 @@ static const struct smb_init_register smb2_init_seq[] = {
 	/*
 	 * This overrides all of the current limit options exposed to userspace
 	 * and prevents the device from pulling more than ~1A. This is done
-	 * to minimise potential fire hazard risks.
+	 * to minimise potential fire hazard risks. smb_variant::fcc_max_ua
+	 * holds this generation to the same ~1A once the battery is known.
 	 */
 	{ .addr = FAST_CHARGE_CURRENT_CFG,
 	  .mask = FAST_CHARGE_CURRENT_SETTING_MASK,
@@ -1171,9 +1178,9 @@ static const struct smb_init_register pmi632_init_seq[] = {
 	  .mask = PRE_CHARGE_CURRENT_SETTING_MASK,
 	  .val = 500000 / SMB5_CURRENT_SCALE_FACTOR },
 	/*
-	 * Cap fast-charge current at ~1A. This is a deliberately conservative
-	 * limit for first bring-up to minimise any fire-hazard risk; the DT
-	 * monitored-battery may lower it further but not raise it past this.
+	 * Fast-charge at ~1A until the battery is known. A board that describes
+	 * a monitored-battery gets its constant-charge-current-max-microamp
+	 * instead, up to smb_variant::fcc_max_ua.
 	 */
 	{ .addr = FAST_CHARGE_CURRENT_CFG,
 	  .mask = FAST_CHARGE_CURRENT_SETTING_MASK,
@@ -1184,6 +1191,7 @@ static const struct smb_variant smb_variant_pmi8998 = {
 	.name = "pmi8998",
 	.status_base = 0x600,
 	.current_scale_ua = CURRENT_SCALE_FACTOR,
+	.fcc_max_ua = 1000000,
 	.float_base_uv = 3480000,	/* (v - 3487500) / 7500 + 1 == (v - 3480000) / 7500 */
 	.float_step_uv = 7500,
 	.ov_bit = CHARGER_ERROR_STATUS_BAT_OV_BIT,
@@ -1197,6 +1205,7 @@ static const struct smb_variant smb_variant_pm660 = {
 	.name = "pm660",
 	.status_base = 0x600,
 	.current_scale_ua = CURRENT_SCALE_FACTOR,
+	.fcc_max_ua = 1000000,
 	.float_base_uv = 3480000,
 	.float_step_uv = 7500,
 	.ov_bit = CHARGER_ERROR_STATUS_BAT_OV_BIT,
@@ -1210,6 +1219,7 @@ static const struct smb_variant smb_variant_pmi632 = {
 	.name = "pmi632",
 	.status_base = 0x100,		/* ICL/POWER_PATH_STATUS in DCDC, not MISC */
 	.current_scale_ua = SMB5_CURRENT_SCALE_FACTOR,
+	.fcc_max_ua = 2000000,
 	.float_base_uv = 3600000,	/* qpnp-smb5 fv: min 3600000, step 10000 */
 	.float_step_uv = 10000,
 	.ov_bit = SMB5_CHARGER_ERROR_STATUS_BAT_OV_BIT,
@@ -1576,14 +1586,6 @@ static int smb_probe(struct platform_device *pdev)
 	if (rc < 0)
 		return rc;
 
-	rc = smb_init_jeita(chip);
-	if (rc < 0)
-		return rc;
-
-	rc = smb_init_cooling(chip);
-	if (rc < 0)
-		return rc;
-
 	supply_config.drv_data = chip;
 	supply_config.fwnode = dev_fwnode(&pdev->dev);
 
@@ -1634,6 +1636,28 @@ static int smb_probe(struct platform_device *pdev)
 				FLOAT_VOLTAGE_SETTING_MASK, rc);
 	if (rc < 0)
 		return dev_err_probe(chip->dev, rc, "Couldn't set vbat max\n");
+
+	/*
+	 * Let the battery say what it will take, bounded by what this driver is
+	 * willing to allow the generation to draw (smb_variant::fcc_max_ua).
+	 */
+	if (chip->batt_info->constant_charge_current_max_ua > 0) {
+		unsigned int fcc_ua = min_t(u32, chip->var->fcc_max_ua,
+					    chip->batt_info->constant_charge_current_max_ua);
+
+		rc = smb_set_fast_charge_current(chip, fcc_ua);
+		if (rc < 0)
+			return dev_err_probe(chip->dev, rc,
+					     "Couldn't set the fast-charge current\n");
+	}
+
+	rc = smb_init_jeita(chip);
+	if (rc < 0)
+		return rc;
+
+	rc = smb_init_cooling(chip);
+	if (rc < 0)
+		return rc;
 
 	rc = smb_init_irq(chip, &irq, "bat-ov", smb_handle_batt_overvoltage);
 	if (rc < 0)
