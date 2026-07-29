@@ -21,6 +21,7 @@
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
 #include <linux/types.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
 /* clang-format off */
@@ -91,6 +92,21 @@
 #define JEITA_EN_COLD_SL_FCV_BIT			BIT(2)
 #define JEITA_EN_HOT_SL_CCC_BIT				BIT(1)
 #define JEITA_EN_COLD_SL_CCC_BIT			BIT(0)
+
+#define JEITA_CCCOMP_CFG_HOT				0x92
+#define JEITA_CCCOMP_CFG_COLD				0x93
+#define JEITA_CCCOMP_MASK				GENMASK(5, 0)
+#define JEITA_CCCOMP_STEP_UA				25000
+
+/*
+ * Two four-byte blocks of comparator thresholds, each holding the hot
+ * threshold followed by the cold one, big-endian, as raw BAT_THERM ADC codes.
+ * A higher code is a colder battery, so the hot threshold is the smaller
+ * number of the pair.
+ */
+#define JEITA_SOFT_THRESHOLDS				0x94
+#define JEITA_HARD_THRESHOLDS				0x98
+#define JEITA_THRESHOLDS_LEN				4
 
 #define INT_RT_STS					0x310
 #define TYPE_C_CHANGE_RT_STS_BIT			BIT(7)
@@ -598,6 +614,22 @@ static int smb_set_current_limit(struct smb_chip *chip, unsigned int val)
 
 	return regmap_write(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG,
 			    val_raw);
+}
+
+static int smb_get_fast_charge_current(struct smb_chip *chip, unsigned int *val)
+{
+	unsigned int val_raw;
+	int rc;
+
+	rc = regmap_read(chip->regmap, chip->base + FAST_CHARGE_CURRENT_CFG,
+			 &val_raw);
+	if (rc < 0)
+		return rc;
+
+	*val = (val_raw & FAST_CHARGE_CURRENT_SETTING_MASK) *
+	       chip->var->current_scale_ua;
+
+	return 0;
 }
 
 static void smb_status_change_work(struct work_struct *work)
@@ -1193,6 +1225,133 @@ static int smb_init_hw(struct smb_chip *chip)
 	return 0;
 }
 
+/*
+ * Write one four-byte JEITA comparator block from a device-tree property
+ * holding the pair of raw BAT_THERM ADC codes { cold, hot }. Absent property
+ * leaves the PMIC's power-on defaults in place.
+ */
+static int smb_set_jeita_thresholds(struct smb_chip *chip, const char *prop,
+				    unsigned int reg)
+{
+	u32 thresh[2];
+	u8 buf[JEITA_THRESHOLDS_LEN];
+	int rc;
+
+	rc = device_property_read_u32_array(chip->dev, prop, thresh,
+					    ARRAY_SIZE(thresh));
+	if (rc == -EINVAL)
+		return 0;
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc, "Couldn't read %s\n", prop);
+
+	if (thresh[0] > U16_MAX || thresh[1] > U16_MAX || thresh[1] >= thresh[0])
+		return dev_err_probe(chip->dev, -EINVAL,
+				     "%s: expected { cold, hot } ADC codes with cold > hot, got { %u, %u }\n",
+				     prop, thresh[0], thresh[1]);
+
+	put_unaligned_be16(thresh[1], &buf[0]);
+	put_unaligned_be16(thresh[0], &buf[2]);
+
+	rc = regmap_bulk_write(chip->regmap, chip->base + reg, buf, sizeof(buf));
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc, "Couldn't write %s\n", prop);
+
+	return 0;
+}
+
+/*
+ * Hardware JEITA. The hard thresholds stop charging outright and need no
+ * enabling; the soft ones only do something once the corresponding
+ * compensation bit is set, and then they subtract a fixed offset from the
+ * fast-charge current. Express that offset as the current we want to be left
+ * with in each soft zone, so the device tree carries a charge current rather
+ * than a register delta.
+ */
+static int smb_init_jeita(struct smb_chip *chip)
+{
+	unsigned int fcc_ua, comp_hot, comp_cold;
+	u32 soft_fcc_ua[2];
+	int rc;
+
+	rc = smb_set_jeita_thresholds(chip, "qcom,jeita-hard-thresholds",
+				      JEITA_HARD_THRESHOLDS);
+	if (rc < 0)
+		return rc;
+
+	rc = smb_set_jeita_thresholds(chip, "qcom,jeita-soft-thresholds",
+				      JEITA_SOFT_THRESHOLDS);
+	if (rc < 0)
+		return rc;
+
+	rc = device_property_read_u32_array(chip->dev,
+					    "qcom,jeita-soft-fcc-microamp",
+					    soft_fcc_ua, ARRAY_SIZE(soft_fcc_ua));
+	if (rc == -EINVAL)
+		return 0;
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't read qcom,jeita-soft-fcc-microamp\n");
+
+	/*
+	 * Read the fast-charge current back out of the hardware rather than
+	 * taking it from the device tree: the compensation is a subtraction
+	 * from whatever is actually programmed.
+	 */
+	rc = smb_get_fast_charge_current(chip, &fcc_ua);
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't read the fast-charge current\n");
+
+	if (soft_fcc_ua[0] > fcc_ua || soft_fcc_ua[1] > fcc_ua)
+		return dev_err_probe(chip->dev, -EINVAL,
+				     "JEITA soft-zone current { %u, %u } exceeds the fast-charge current %u\n",
+				     soft_fcc_ua[0], soft_fcc_ua[1], fcc_ua);
+
+	/* Round the reduction up, so the result is never above what was asked. */
+	comp_cold = DIV_ROUND_UP(fcc_ua - soft_fcc_ua[0], JEITA_CCCOMP_STEP_UA);
+	comp_hot = DIV_ROUND_UP(fcc_ua - soft_fcc_ua[1], JEITA_CCCOMP_STEP_UA);
+
+	if (comp_cold > JEITA_CCCOMP_MASK || comp_hot > JEITA_CCCOMP_MASK)
+		return dev_err_probe(chip->dev, -ERANGE,
+				     "JEITA soft-zone current { %u, %u } is more than %u uA below the fast-charge current %u\n",
+				     soft_fcc_ua[0], soft_fcc_ua[1],
+				     (unsigned int)JEITA_CCCOMP_MASK *
+					     JEITA_CCCOMP_STEP_UA,
+				     fcc_ua);
+
+	rc = regmap_update_bits(chip->regmap,
+				chip->base + JEITA_CCCOMP_CFG_COLD,
+				JEITA_CCCOMP_MASK, comp_cold);
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't set the cold JEITA compensation\n");
+
+	rc = regmap_update_bits(chip->regmap, chip->base + JEITA_CCCOMP_CFG_HOT,
+				JEITA_CCCOMP_MASK, comp_hot);
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't set the hot JEITA compensation\n");
+
+	/*
+	 * Only the charge-current halves are enabled here. The float-voltage
+	 * ones are left as the PMIC defaults them: this driver has no way to
+	 * describe the voltage reduction they apply.
+	 */
+	rc = regmap_update_bits(chip->regmap, chip->base + JEITA_EN_CFG,
+				JEITA_EN_HOT_SL_CCC_BIT | JEITA_EN_COLD_SL_CCC_BIT,
+				JEITA_EN_HOT_SL_CCC_BIT | JEITA_EN_COLD_SL_CCC_BIT);
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't enable JEITA compensation\n");
+
+	dev_dbg(chip->dev,
+		"JEITA: fcc %u uA, soft-zone cold %u uA (-%u), hot %u uA (-%u)\n",
+		fcc_ua, soft_fcc_ua[0], comp_cold * JEITA_CCCOMP_STEP_UA,
+		soft_fcc_ua[1], comp_hot * JEITA_CCCOMP_STEP_UA);
+
+	return 0;
+}
+
 static int smb_init_irq(struct smb_chip *chip, int *irq, const char *name,
 			 irqreturn_t (*handler)(int irq, void *data))
 {
@@ -1281,6 +1440,10 @@ static int smb_probe(struct platform_device *pdev)
 	}
 
 	rc = smb_init_hw(chip);
+	if (rc < 0)
+		return rc;
+
+	rc = smb_init_jeita(chip);
 	if (rc < 0)
 		return rc;
 
