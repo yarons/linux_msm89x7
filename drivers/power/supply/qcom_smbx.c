@@ -9,6 +9,7 @@
  */
 
 #include <linux/bits.h>
+#include <linux/cleanup.h>
 #include <linux/devm-helpers.h>
 #include <linux/iio/consumer.h>
 #include <linux/interrupt.h>
@@ -19,6 +20,7 @@
 #include <linux/pm_wakeirq.h>
 #include <linux/of.h>
 #include <linux/power_supply.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/thermal.h>
 #include <linux/types.h>
@@ -1257,19 +1259,20 @@ static int smb_init_hw(struct smb_chip *chip)
 }
 
 /*
- * Write one four-byte JEITA comparator block from a device-tree property
- * holding the pair of raw BAT_THERM ADC codes { cold, hot }. Absent property
- * leaves the PMIC's power-on defaults in place.
+ * Write one four-byte JEITA comparator block from a property on the battery
+ * node holding the pair of raw BAT_THERM ADC codes { cold, hot }. Absent
+ * property leaves the PMIC's power-on defaults in place.
  */
-static int smb_set_jeita_thresholds(struct smb_chip *chip, const char *prop,
-				    unsigned int reg)
+static int smb_set_jeita_thresholds(struct smb_chip *chip,
+				    struct fwnode_handle *batt,
+				    const char *prop, unsigned int reg)
 {
 	u32 thresh[2];
 	u8 buf[JEITA_THRESHOLDS_LEN];
 	int rc;
 
-	rc = device_property_read_u32_array(chip->dev, prop, thresh,
-					    ARRAY_SIZE(thresh));
+	rc = fwnode_property_read_u32_array(batt, prop, thresh,
+					   ARRAY_SIZE(thresh));
 	if (rc == -EINVAL)
 		return 0;
 	if (rc < 0)
@@ -1295,28 +1298,38 @@ static int smb_set_jeita_thresholds(struct smb_chip *chip, const char *prop,
  * enabling; the soft ones only do something once the corresponding
  * compensation bit is set, and then they subtract a fixed offset from the
  * fast-charge current. Express that offset as the current we want to be left
- * with in each soft zone, so the device tree carries a charge current rather
+ * with in each soft zone, so the battery node carries a charge current rather
  * than a register delta.
+ *
+ * All of it is read from the monitored battery, not from this device: which
+ * temperatures a cell may be charged at, and how hard, is a property of the
+ * cell. A board that fits more than one pack describes each of them.
  */
 static int smb_init_jeita(struct smb_chip *chip)
 {
+	struct fwnode_handle *batt __free(fwnode_handle) =
+		fwnode_find_reference(dev_fwnode(chip->dev),
+				      "monitored-battery", 0);
 	unsigned int fcc_ua, comp_hot, comp_cold;
 	u32 soft_fcc_ua[2];
 	int rc;
 
-	rc = smb_set_jeita_thresholds(chip, "qcom,jeita-hard-thresholds",
+	if (IS_ERR(batt))
+		return 0;
+
+	rc = smb_set_jeita_thresholds(chip, batt, "qcom,jeita-hard-thresholds",
 				      JEITA_HARD_THRESHOLDS);
 	if (rc < 0)
 		return rc;
 
-	rc = smb_set_jeita_thresholds(chip, "qcom,jeita-soft-thresholds",
+	rc = smb_set_jeita_thresholds(chip, batt, "qcom,jeita-soft-thresholds",
 				      JEITA_SOFT_THRESHOLDS);
 	if (rc < 0)
 		return rc;
 
-	rc = device_property_read_u32_array(chip->dev,
-					    "qcom,jeita-soft-fcc-microamp",
-					    soft_fcc_ua, ARRAY_SIZE(soft_fcc_ua));
+	rc = fwnode_property_read_u32_array(batt,
+					   "qcom,jeita-soft-fcc-microamp",
+					   soft_fcc_ua, ARRAY_SIZE(soft_fcc_ua));
 	if (rc == -EINVAL)
 		return 0;
 	if (rc < 0)
