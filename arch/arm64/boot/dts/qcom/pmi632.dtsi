@@ -70,6 +70,8 @@
 			io-channel-names = "usbin_i", "usbin_v", "vbat",
 					   "bat_therm";
 
+			#cooling-cells = <2>;
+
 			status = "disabled";
 		};
 
