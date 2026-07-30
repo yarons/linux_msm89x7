@@ -35,6 +35,7 @@
 #define INPUT_CURRENT_LIMITED_BIT			BIT(7)
 #define CHARGER_ERROR_STATUS_SFT_EXPIRE_BIT		BIT(6)
 #define CHARGER_ERROR_STATUS_BAT_OV_BIT			BIT(5)
+#define SMB5_CHARGER_ERROR_STATUS_BAT_OV_BIT		BIT(1)
 #define CHARGER_ERROR_STATUS_BAT_TERM_MISSING_BIT	BIT(4)
 #define BAT_TEMP_STATUS_MASK				GENMASK(3, 0)
 #define BAT_TEMP_STATUS_SOFT_LIMIT_MASK			GENMASK(3, 2)
@@ -303,10 +304,16 @@
 #define AICL_SWITCH_ENABLE_BIT				BIT(1)
 #define ZIN_ICL_ENABLE_BIT				BIT(0)
 
-#define ICL_STATUS					0x607
+/*
+ * ICL_STATUS and POWER_PATH_STATUS live in the MISC peripheral (base offset
+ * 0x600) on SMB2 (pmi8998/pm660) but in the DCDC peripheral (0x100) on SMB5
+ * (pmi632). The generation-dependent prefix is held in smb_variant::status_base
+ * and added to chip->base at the call sites, so these are in-peripheral offsets.
+ */
+#define ICL_STATUS					0x07
 #define INPUT_CURRENT_LIMIT_MASK			GENMASK(7, 0)
 
-#define POWER_PATH_STATUS				0x60B
+#define POWER_PATH_STATUS				0x0B
 #define P_PATH_INPUT_SS_DONE_BIT			BIT(7)
 #define P_PATH_USBIN_SUSPEND_STS_BIT			BIT(6)
 #define P_PATH_DCIN_SUSPEND_STS_BIT			BIT(5)
@@ -372,6 +379,41 @@ struct smb_init_register {
 };
 
 /**
+ * struct smb_variant - per-PMIC-generation parameters
+ * @name:		Model name, used for the power_supply name
+ * @status_base:	Peripheral prefix for ICL_STATUS / POWER_PATH_STATUS
+ *			(0x600 = MISC on SMB2, 0x100 = DCDC on SMB5)
+ * @current_scale_ua:	uA per LSB of the FCC / ICL registers
+ *			(25000 on SMB2/pmi8998, 50000 on SMB5/pmi632)
+ * @float_base_uv:	Float-voltage register value 0 corresponds to this voltage
+ * @float_step_uv:	uV per LSB of FLOAT_VOLTAGE_CFG
+ * @ov_bit:		BAT_OV (overvoltage) bit within BATTERY_CHARGER_STATUS_2
+ *			(BIT(5) on SMB2, BIT(1) on SMB5)
+ * @temp_status_reg:	Register holding the JEITA temperature-status bits,
+ *			relative to @base (BATTERY_CHARGER_STATUS_2 = 0x07 on
+ *			SMB2, BATTERY_CHARGER_STATUS_7 = 0x0D on SMB5)
+ * @temp_status_shift:	Left-shift of the HOT_SOFT/COLD_SOFT/TOO_HOT/TOO_COLD
+ *			bits versus the SMB2 baseline (0 on SMB2, 2 on SMB5)
+ * @init_seq:		HW init register write sequence for this generation
+ * @init_seq_len:	Number of entries in @init_seq
+ *
+ * All values are taken from the Qualcomm downstream qpnp-smb2 / qpnp-smb5
+ * drivers (smb_chg_param tables) so the current/voltage scaling is exact.
+ */
+struct smb_variant {
+	const char *name;
+	u16 status_base;
+	u32 current_scale_ua;
+	u32 float_base_uv;
+	u32 float_step_uv;
+	u8 ov_bit;
+	u16 temp_status_reg;
+	u8 temp_status_shift;
+	const struct smb_init_register *init_seq;
+	int init_seq_len;
+};
+
+/**
  * struct smb_chip - smb chip structure
  * @dev:		Device reference for power_supply
  * @name:		The platform device name
@@ -383,12 +425,16 @@ struct smb_init_register {
  * @wakeup_enabled:	If the cable IRQ will cause a wakeup
  * @usb_in_i_chan:	USB_IN current measurement channel
  * @usb_in_v_chan:	USB_IN voltage measurement channel
+ * @vbat_chan:		Battery voltage (VBAT_SNS) measurement channel
+ * @bat_therm_chan:	Battery thermistor (BAT_THERM) measurement channel
  * @chg_psy:		Charger power supply instance
+ * @batt_psy:		Battery (fuel-gauge) power supply instance
  */
 struct smb_chip {
 	struct device *dev;
 	const char *name;
 	unsigned int base;
+	const struct smb_variant *var;
 	struct regmap *regmap;
 	struct power_supply_battery_info *batt_info;
 
@@ -398,8 +444,11 @@ struct smb_chip {
 
 	struct iio_channel *usb_in_i_chan;
 	struct iio_channel *usb_in_v_chan;
+	struct iio_channel *vbat_chan;
+	struct iio_channel *bat_therm_chan;
 
 	struct power_supply *chg_psy;
+	struct power_supply *batt_psy;
 };
 
 static enum power_supply_property smb_properties[] = {
@@ -419,7 +468,9 @@ static int smb_get_prop_usb_online(struct smb_chip *chip, int *val)
 	unsigned int stat;
 	int rc;
 
-	rc = regmap_read(chip->regmap, chip->base + POWER_PATH_STATUS, &stat);
+	rc = regmap_read(chip->regmap,
+			 chip->base + chip->var->status_base + POWER_PATH_STATUS,
+			 &stat);
 	if (rc < 0) {
 		dev_err(chip->dev, "Couldn't read power path status: %d\n", rc);
 		return rc;
@@ -525,10 +576,12 @@ static int smb_get_prop_status(struct smb_chip *chip, int *val)
 static inline int smb_get_current_limit(struct smb_chip *chip,
 					 unsigned int *val)
 {
-	int rc = regmap_read(chip->regmap, chip->base + ICL_STATUS, val);
+	int rc = regmap_read(chip->regmap,
+			     chip->base + chip->var->status_base + ICL_STATUS,
+			     val);
 
 	if (rc >= 0)
-		*val *= CURRENT_SCALE_FACTOR;
+		*val *= chip->var->current_scale_ua;
 	return rc;
 }
 
@@ -541,7 +594,7 @@ static int smb_set_current_limit(struct smb_chip *chip, unsigned int val)
 			"Can't set current limit higher than 4800000uA");
 		return -EINVAL;
 	}
-	val_raw = val / CURRENT_SCALE_FACTOR;
+	val_raw = val / chip->var->current_scale_ua;
 
 	return regmap_write(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG,
 			    val_raw);
@@ -597,6 +650,8 @@ static void smb_status_change_work(struct work_struct *work)
 
 	smb_set_current_limit(chip, current_ua);
 	power_supply_changed(chip->chg_psy);
+	if (chip->batt_psy)
+		power_supply_changed(chip->batt_psy);
 }
 
 static int smb_get_iio_chan(struct smb_chip *chip, struct iio_channel *chan,
@@ -625,6 +680,10 @@ static int smb_get_prop_health(struct smb_chip *chip, int *val)
 	int rc;
 	unsigned int stat;
 
+	/*
+	 * Battery overvoltage is reported in BATTERY_CHARGER_STATUS_2 on both
+	 * generations, but at a different bit (smb_variant::ov_bit).
+	 */
 	rc = regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_2,
 			 &stat);
 	if (rc < 0) {
@@ -632,26 +691,37 @@ static int smb_get_prop_health(struct smb_chip *chip, int *val)
 		return rc;
 	}
 
-	switch (stat) {
-	case CHARGER_ERROR_STATUS_BAT_OV_BIT:
+	if (stat & chip->var->ov_bit) {
 		*val = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
 		return 0;
-	case BAT_TEMP_STATUS_TOO_COLD_BIT:
-		*val = POWER_SUPPLY_HEALTH_COLD;
-		return 0;
-	case BAT_TEMP_STATUS_TOO_HOT_BIT:
-		*val = POWER_SUPPLY_HEALTH_OVERHEAT;
-		return 0;
-	case BAT_TEMP_STATUS_COLD_SOFT_LIMIT_BIT:
-		*val = POWER_SUPPLY_HEALTH_COOL;
-		return 0;
-	case BAT_TEMP_STATUS_HOT_SOFT_LIMIT_BIT:
-		*val = POWER_SUPPLY_HEALTH_WARM;
-		return 0;
-	default:
-		*val = POWER_SUPPLY_HEALTH_GOOD;
-		return 0;
 	}
+
+	/*
+	 * JEITA temperature status. On SMB2 it shares BATTERY_CHARGER_STATUS_2;
+	 * on SMB5 it lives in BATTERY_CHARGER_STATUS_7 with the bits shifted up
+	 * by two. The per-variant register and shift select the right layout.
+	 * Test bits individually (a register may have several set) and let the
+	 * hard limits take precedence over the soft ones.
+	 */
+	rc = regmap_read(chip->regmap, chip->base + chip->var->temp_status_reg,
+			 &stat);
+	if (rc < 0) {
+		dev_err(chip->dev, "Couldn't read temp status rc=%d\n", rc);
+		return rc;
+	}
+
+	if (stat & (BAT_TEMP_STATUS_TOO_HOT_BIT << chip->var->temp_status_shift))
+		*val = POWER_SUPPLY_HEALTH_OVERHEAT;
+	else if (stat & (BAT_TEMP_STATUS_TOO_COLD_BIT << chip->var->temp_status_shift))
+		*val = POWER_SUPPLY_HEALTH_COLD;
+	else if (stat & (BAT_TEMP_STATUS_HOT_SOFT_LIMIT_BIT << chip->var->temp_status_shift))
+		*val = POWER_SUPPLY_HEALTH_WARM;
+	else if (stat & (BAT_TEMP_STATUS_COLD_SOFT_LIMIT_BIT << chip->var->temp_status_shift))
+		*val = POWER_SUPPLY_HEALTH_COOL;
+	else
+		*val = POWER_SUPPLY_HEALTH_GOOD;
+
+	return 0;
 }
 
 static int smb_get_property(struct power_supply *psy,
@@ -727,7 +797,7 @@ static irqreturn_t smb_handle_batt_overvoltage(int irq, void *data)
 	regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_2,
 		    &status);
 
-	if (status & CHARGER_ERROR_STATUS_BAT_OV_BIT) {
+	if (status & chip->var->ov_bit) {
 		/* The hardware stops charging automatically */
 		dev_err(chip->dev, "battery overvoltage detected\n");
 		power_supply_changed(chip->chg_psy);
@@ -741,6 +811,8 @@ static irqreturn_t smb_handle_usb_plugin(int irq, void *data)
 	struct smb_chip *chip = data;
 
 	power_supply_changed(chip->chg_psy);
+	if (chip->batt_psy)
+		power_supply_changed(chip->batt_psy);
 
 	schedule_delayed_work(&chip->status_change_work,
 			      msecs_to_jiffies(1500));
@@ -772,6 +844,113 @@ static irqreturn_t smb_handle_wdog_bark(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/*
+ * Battery (fuel-gauge) power supply.
+ *
+ * PMI632 has no coulomb-counting fuel gauge in mainline; the downstream
+ * QG block is a voltage-based gauge. We replicate the essential algorithm:
+ * read VBAT_SNS via the PMIC ADC and look up the state-of-charge from the
+ * OCV->capacity table carried in the monitored-battery DT node (which was
+ * extracted from the downstream QG battery profile). The power-supply core
+ * does the interpolation. Reading is non-invasive (ADC only).
+ */
+static enum power_supply_property smb_batt_properties[] = {
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_HEALTH,
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_TECHNOLOGY,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_TEMP,
+};
+
+static int smb_get_vbat(struct smb_chip *chip, int *val)
+{
+	if (IS_ERR_OR_NULL(chip->vbat_chan))
+		return -ENODATA;
+
+	/* ADC5 processed voltage channels return microvolts */
+	return iio_read_channel_processed(chip->vbat_chan, val);
+}
+
+static int smb_get_batt_temp(struct smb_chip *chip, int *val)
+{
+	int temp, rc;
+
+	if (IS_ERR_OR_NULL(chip->bat_therm_chan))
+		return -ENODATA;
+
+	/* The ADC returns millidegrees C, the power supply class decidegrees */
+	rc = iio_read_channel_processed(chip->bat_therm_chan, &temp);
+	if (rc < 0)
+		return rc;
+
+	*val = temp / 100;
+	return 0;
+}
+
+static int smb_get_batt_capacity(struct smb_chip *chip, int *val)
+{
+	int ocv_uv, cap, rc;
+
+	if (!chip->batt_info)
+		return -ENODATA;
+
+	rc = smb_get_vbat(chip, &ocv_uv);
+	if (rc < 0)
+		return rc;
+
+	/*
+	 * Use the instantaneous battery voltage as the OCV estimate. Under
+	 * load this sags (reads low while discharging, high while charging);
+	 * a future ESR/IR-drop compensation could refine it. Assume room
+	 * temperature (25 degC), matching the single OCV table we ship.
+	 */
+	cap = power_supply_batinfo_ocv2cap(chip->batt_info, ocv_uv, 25);
+	if (cap < 0)
+		return cap;
+
+	*val = clamp(cap, 0, 100);
+	return 0;
+}
+
+static int smb_batt_get_property(struct power_supply *psy,
+				 enum power_supply_property psp,
+				 union power_supply_propval *val)
+{
+	struct smb_chip *chip = power_supply_get_drvdata(psy);
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_STATUS:
+		return smb_get_prop_status(chip, &val->intval);
+	case POWER_SUPPLY_PROP_HEALTH:
+		return smb_get_prop_health(chip, &val->intval);
+	case POWER_SUPPLY_PROP_PRESENT:
+		val->intval = 1;
+		return 0;
+	case POWER_SUPPLY_PROP_TECHNOLOGY:
+		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
+		return 0;
+	case POWER_SUPPLY_PROP_CAPACITY:
+		return smb_get_batt_capacity(chip, &val->intval);
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		return smb_get_vbat(chip, &val->intval);
+	case POWER_SUPPLY_PROP_TEMP:
+		return smb_get_batt_temp(chip, &val->intval);
+	default:
+		dev_err(chip->dev, "invalid battery property: %d\n", psp);
+		return -EINVAL;
+	}
+}
+
+static const struct power_supply_desc smb_batt_psy_desc = {
+	.name = "pmi632-battery",
+	.type = POWER_SUPPLY_TYPE_BATTERY,
+	.properties = smb_batt_properties,
+	.num_properties = ARRAY_SIZE(smb_batt_properties),
+	.get_property = smb_batt_get_property,
+};
+
 static const struct power_supply_desc smb_psy_desc = {
 	.name = "pmi8998_charger",
 	.type = POWER_SUPPLY_TYPE_USB,
@@ -786,8 +965,8 @@ static const struct power_supply_desc smb_psy_desc = {
 	.property_is_writeable = smb_property_is_writable,
 };
 
-/* Init sequence derived from vendor downstream driver */
-static const struct smb_init_register smb_init_seq[] = {
+/* Init sequence derived from vendor downstream driver (SMB2: pmi8998/pm660) */
+static const struct smb_init_register smb2_init_seq[] = {
 	{ .addr = AICL_RERUN_TIME_CFG, .mask = AICL_RERUN_TIME_MASK, .val = 0 },
 	/*
 	 * By default configure us as an upstream facing port
@@ -889,17 +1068,122 @@ static const struct smb_init_register smb_init_seq[] = {
 	  .val = 1000000 / CURRENT_SCALE_FACTOR },
 };
 
+/*
+ * SMB5 (pmi632) current registers step in 50mA (not 25mA), so the FCC/pre-charge
+ * raw values below use 50000 uA/LSB. Type-C, OTG and STAT/recharge-select writes
+ * from the SMB2 sequence are intentionally omitted: on SMB5 the Type-C block lives
+ * at its own base (0x1500, owned here by the qcom,pmi632-typec / tcpm driver) and
+ * those SMB2 offsets would hit the wrong registers. Only CHGR, USBIN (AICL/ICL/
+ * HVDCP) and MISC (watchdog) writes are kept — these share offsets with SMB2.
+ */
+#define SMB5_CURRENT_SCALE_FACTOR			50000
+static const struct smb_init_register pmi632_init_seq[] = {
+	/* Enable charging */
+	{ .addr = USBIN_OPTIONS_1_CFG, .mask = HVDCP_EN_BIT, .val = 0 },
+	{ .addr = CHARGING_ENABLE_CMD,
+	  .mask = CHARGING_ENABLE_CMD_BIT,
+	  .val = CHARGING_ENABLE_CMD_BIT },
+	/* Charger enable controlled by software; inhibit based on battery voltage */
+	{ .addr = CHGR_CFG2,
+	  .mask = CHG_EN_SRC_BIT | CHG_EN_POLARITY_BIT |
+		  PRETOFAST_TRANSITION_CFG_BIT | BAT_OV_ECC_BIT | I_TERM_BIT |
+		  AUTO_RECHG_BIT | EN_ANALOG_DROP_IN_VBATT_BIT |
+		  CHARGER_INHIBIT_BIT,
+	  .val = CHARGER_INHIBIT_BIT },
+	/* Default SDP charger to a 500mA USB 2.0 port */
+	{ .addr = USBIN_ICL_OPTIONS,
+	  .mask = USB51_MODE_BIT | USBIN_MODE_CHG_BIT,
+	  .val = USB51_MODE_BIT },
+	/* Disable the charger watchdog */
+	{ .addr = SNARL_BARK_BITE_WD_CFG, .mask = 0xff, .val = 0 },
+	{ .addr = WD_CFG,
+	  .mask = WATCHDOG_TRIGGER_AFP_EN_BIT | WDOG_TIMER_EN_ON_PLUGIN_BIT |
+		  BARK_WDOG_INT_EN_BIT,
+	  .val = 0 },
+	{ .addr = USBIN_5V_AICL_THRESHOLD_CFG,
+	  .mask = USBIN_5V_AICL_THRESHOLD_CFG_MASK,
+	  .val = 0x3 },
+	{ .addr = USBIN_CONT_AICL_THRESHOLD_CFG,
+	  .mask = USBIN_CONT_AICL_THRESHOLD_CFG_MASK,
+	  .val = 0x3 },
+	/* Enable Automatic Input Current Limit */
+	{ .addr = USBIN_AICL_OPTIONS_CFG,
+	  .mask = USBIN_AICL_START_AT_MAX_BIT | USBIN_AICL_ADC_EN_BIT |
+		  USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT |
+		  USBIN_HV_COLLAPSE_RESPONSE_BIT |
+		  USBIN_LV_COLLAPSE_RESPONSE_BIT,
+	  .val = USBIN_HV_COLLAPSE_RESPONSE_BIT |
+		 USBIN_LV_COLLAPSE_RESPONSE_BIT | USBIN_AICL_EN_BIT },
+	{ .addr = PRE_CHARGE_CURRENT_CFG,
+	  .mask = PRE_CHARGE_CURRENT_SETTING_MASK,
+	  .val = 500000 / SMB5_CURRENT_SCALE_FACTOR },
+	/*
+	 * Cap fast-charge current at ~1A. This is a deliberately conservative
+	 * limit for first bring-up to minimise any fire-hazard risk; the DT
+	 * monitored-battery may lower it further but not raise it past this.
+	 */
+	{ .addr = FAST_CHARGE_CURRENT_CFG,
+	  .mask = FAST_CHARGE_CURRENT_SETTING_MASK,
+	  .val = 1000000 / SMB5_CURRENT_SCALE_FACTOR },
+};
+
+static const struct smb_variant smb_variant_pmi8998 = {
+	.name = "pmi8998",
+	.status_base = 0x600,
+	.current_scale_ua = CURRENT_SCALE_FACTOR,
+	.float_base_uv = 3480000,	/* (v - 3487500) / 7500 + 1 == (v - 3480000) / 7500 */
+	.float_step_uv = 7500,
+	.ov_bit = CHARGER_ERROR_STATUS_BAT_OV_BIT,
+	.temp_status_reg = BATTERY_CHARGER_STATUS_2,
+	.temp_status_shift = 0,
+	.init_seq = smb2_init_seq,
+	.init_seq_len = ARRAY_SIZE(smb2_init_seq),
+};
+
+static const struct smb_variant smb_variant_pm660 = {
+	.name = "pm660",
+	.status_base = 0x600,
+	.current_scale_ua = CURRENT_SCALE_FACTOR,
+	.float_base_uv = 3480000,
+	.float_step_uv = 7500,
+	.ov_bit = CHARGER_ERROR_STATUS_BAT_OV_BIT,
+	.temp_status_reg = BATTERY_CHARGER_STATUS_2,
+	.temp_status_shift = 0,
+	.init_seq = smb2_init_seq,
+	.init_seq_len = ARRAY_SIZE(smb2_init_seq),
+};
+
+static const struct smb_variant smb_variant_pmi632 = {
+	.name = "pmi632",
+	.status_base = 0x100,		/* ICL/POWER_PATH_STATUS in DCDC, not MISC */
+	.current_scale_ua = SMB5_CURRENT_SCALE_FACTOR,
+	.float_base_uv = 3600000,	/* qpnp-smb5 fv: min 3600000, step 10000 */
+	.float_step_uv = 10000,
+	.ov_bit = SMB5_CHARGER_ERROR_STATUS_BAT_OV_BIT,
+	/*
+	 * On SMB5 the JEITA temperature-status bits moved out of
+	 * BATTERY_CHARGER_STATUS_2 into BATTERY_CHARGER_STATUS_7, and the
+	 * HOT_SOFT/COLD_SOFT/TOO_HOT/TOO_COLD bits shifted up by two
+	 * (verified against the downstream qpnp-smb5 smb5-reg.h and read back
+	 * on a Fairphone 3: STATUS_2=0x28 is reserved data, STATUS_7=0x00).
+	 */
+	.temp_status_reg = BATTERY_CHARGER_STATUS_7,
+	.temp_status_shift = 2,
+	.init_seq = pmi632_init_seq,
+	.init_seq_len = ARRAY_SIZE(pmi632_init_seq),
+};
+
 static int smb_init_hw(struct smb_chip *chip)
 {
 	int rc, i;
 
-	for (i = 0; i < ARRAY_SIZE(smb_init_seq); i++) {
+	for (i = 0; i < chip->var->init_seq_len; i++) {
 		dev_dbg(chip->dev, "%d: Writing 0x%02x to 0x%02x\n", i,
-			smb_init_seq[i].val, smb_init_seq[i].addr);
+			chip->var->init_seq[i].val, chip->var->init_seq[i].addr);
 		rc = regmap_update_bits(chip->regmap,
-					chip->base + smb_init_seq[i].addr,
-					smb_init_seq[i].mask,
-					smb_init_seq[i].val);
+					chip->base + chip->var->init_seq[i].addr,
+					chip->var->init_seq[i].mask,
+					chip->var->init_seq[i].val);
 		if (rc < 0)
 			return dev_err_probe(chip->dev, rc,
 					     "%s: init command %d failed\n",
@@ -945,6 +1229,11 @@ static int smb_probe(struct platform_device *pdev)
 	chip->dev = &pdev->dev;
 	chip->name = pdev->name;
 
+	chip->var = device_get_match_data(&pdev->dev);
+	if (!chip->var)
+		return dev_err_probe(chip->dev, -ENODEV,
+				     "no match data for device\n");
+
 	chip->regmap = dev_get_regmap(pdev->dev.parent, NULL);
 	if (!chip->regmap)
 		return dev_err_probe(chip->dev, -ENODEV,
@@ -966,6 +1255,31 @@ static int smb_probe(struct platform_device *pdev)
 				     "Couldn't get usbin_i IIO channel\n");
 	}
 
+	/*
+	 * VBAT_SNS is optional: it drives the voltage-based fuel gauge and is
+	 * only present on variants that wire it up (PMI632). Defer if the ADC
+	 * isn't ready yet, otherwise carry on without a battery gauge.
+	 */
+	chip->vbat_chan = devm_iio_channel_get(chip->dev, "vbat");
+	if (IS_ERR(chip->vbat_chan)) {
+		rc = PTR_ERR(chip->vbat_chan);
+		if (rc == -EPROBE_DEFER)
+			return rc;
+		chip->vbat_chan = NULL;
+	}
+
+	/*
+	 * BAT_THERM is optional in the same way: only boards that route the
+	 * pack thermistor to the PMIC can report a battery temperature.
+	 */
+	chip->bat_therm_chan = devm_iio_channel_get(chip->dev, "bat_therm");
+	if (IS_ERR(chip->bat_therm_chan)) {
+		rc = PTR_ERR(chip->bat_therm_chan);
+		if (rc == -EPROBE_DEFER)
+			return rc;
+		chip->bat_therm_chan = NULL;
+	}
+
 	rc = smb_init_hw(chip);
 	if (rc < 0)
 		return rc;
@@ -979,7 +1293,7 @@ static int smb_probe(struct platform_device *pdev)
 	memcpy(desc, &smb_psy_desc, sizeof(smb_psy_desc));
 	desc->name =
 		devm_kasprintf(chip->dev, GFP_KERNEL, "%s-charger",
-			       (const char *)device_get_match_data(chip->dev));
+			       chip->var->name);
 	if (!desc->name)
 		return -ENOMEM;
 
@@ -994,13 +1308,28 @@ static int smb_probe(struct platform_device *pdev)
 		return dev_err_probe(chip->dev, rc,
 				     "Failed to get battery info\n");
 
+	/*
+	 * Register a battery (fuel-gauge) power supply only when we can
+	 * actually estimate state of charge: a VBAT channel plus an
+	 * OCV->capacity table from the monitored-battery node.
+	 */
+	if (chip->vbat_chan && chip->batt_info->ocv_table[0]) {
+		chip->batt_psy = devm_power_supply_register(chip->dev,
+							    &smb_batt_psy_desc,
+							    &supply_config);
+		if (IS_ERR(chip->batt_psy))
+			return dev_err_probe(chip->dev, PTR_ERR(chip->batt_psy),
+					     "failed to register battery power supply\n");
+	}
+
 	rc = devm_delayed_work_autocancel(chip->dev, &chip->status_change_work,
 					  smb_status_change_work);
 	if (rc)
 		return dev_err_probe(chip->dev, rc,
 				     "Failed to init status change work\n");
 
-	rc = (chip->batt_info->voltage_max_design_uv - 3487500) / 7500 + 1;
+	rc = (chip->batt_info->voltage_max_design_uv - chip->var->float_base_uv) /
+	     chip->var->float_step_uv;
 	rc = regmap_update_bits(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
 				FLOAT_VOLTAGE_SETTING_MASK, rc);
 	if (rc < 0)
@@ -1038,8 +1367,9 @@ static int smb_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id smb_match_id_table[] = {
-	{ .compatible = "qcom,pmi8998-charger", .data = "pmi8998" },
-	{ .compatible = "qcom,pm660-charger", .data = "pm660" },
+	{ .compatible = "qcom,pmi8998-charger", .data = &smb_variant_pmi8998 },
+	{ .compatible = "qcom,pm660-charger", .data = &smb_variant_pm660 },
+	{ .compatible = "qcom,pmi632-charger", .data = &smb_variant_pmi632 },
 	{ /* sentinal */ }
 };
 MODULE_DEVICE_TABLE(of, smb_match_id_table);
