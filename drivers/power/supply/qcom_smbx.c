@@ -111,6 +111,10 @@
 #define JEITA_HARD_THRESHOLDS				0x98
 #define JEITA_THRESHOLDS_LEN				4
 
+/* The BAT_ID divider is biased from the ADC's own 1.875 V reference. */
+#define BATT_ID_VREF_UV					1875000
+#define BATT_ID_DEFAULT_TOLERANCE_PCT			15
+
 #define INT_RT_STS					0x310
 #define TYPE_C_CHANGE_RT_STS_BIT			BIT(7)
 #define USBIN_ICL_CHANGE_RT_STS_BIT			BIT(6)
@@ -452,6 +456,8 @@ struct smb_variant {
  * @usb_in_v_chan:	USB_IN voltage measurement channel
  * @vbat_chan:		Battery voltage (VBAT_SNS) measurement channel
  * @bat_therm_chan:	Battery thermistor (BAT_THERM) measurement channel
+ * @bat_id_chan:	Battery-ID resistor measurement channel, if the board
+ *			routes one
  * @chg_psy:		Charger power supply instance
  * @batt_psy:		Battery (fuel-gauge) power supply instance
  * @thermal_mitigation_ua: Fast-charge current for each thermal cooling state,
@@ -475,6 +481,7 @@ struct smb_chip {
 	struct iio_channel *usb_in_v_chan;
 	struct iio_channel *vbat_chan;
 	struct iio_channel *bat_therm_chan;
+	struct iio_channel *bat_id_chan;
 
 	struct power_supply *chg_psy;
 	struct power_supply *batt_psy;
@@ -1294,6 +1301,67 @@ static int smb_set_jeita_thresholds(struct smb_chip *chip,
 }
 
 /*
+ * A board that can be fitted with more than one battery tells them apart by a
+ * resistor in the pack, read through a divider against the ADC's reference.
+ *
+ * This driver cannot *choose* between two batteries - a power supply has one
+ * monitored-battery and there is no binding for more - but it can refuse to
+ * apply one battery's limits to a different battery, which is the failure that
+ * actually hurts: a cell charged to another cell's currents and temperature
+ * limits, silently, because the device tree names only one.
+ *
+ * Returns 1 when the described battery is the one fitted, or when nothing here
+ * says otherwise; 0 when it demonstrably is not; negative on error.
+ */
+static int smb_verify_battery_id(struct smb_chip *chip)
+{
+	struct fwnode_handle *batt __free(fwnode_handle) =
+		fwnode_find_reference(dev_fwnode(chip->dev),
+				      "monitored-battery", 0);
+	u32 expect_ohm, pullup_ohm;
+	u32 tol_pct = BATT_ID_DEFAULT_TOLERANCE_PCT;
+	int rc, uv, ohm;
+
+	if (IS_ERR(batt))
+		return 1;
+
+	/* All three have to be described before there is anything to check. */
+	if (fwnode_property_read_u32(batt, "qcom,batt-id-ohm", &expect_ohm) ||
+	    device_property_read_u32(chip->dev, "qcom,batt-id-pullup-ohm",
+				     &pullup_ohm) ||
+	    !chip->bat_id_chan)
+		return 1;
+
+	fwnode_property_read_u32(batt, "qcom,batt-id-tolerance-percent",
+				 &tol_pct);
+
+	rc = iio_read_channel_processed(chip->bat_id_chan, &uv);
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't read the battery ID\n");
+
+	if (uv <= 0 || uv >= BATT_ID_VREF_UV) {
+		dev_err(chip->dev,
+			"Battery ID line reads %d uV: open or shorted\n", uv);
+		return 0;
+	}
+
+	ohm = div_u64((u64)pullup_ohm * uv, BATT_ID_VREF_UV - uv);
+
+	if (abs(ohm - (int)expect_ohm) * 100 > (int)expect_ohm * (int)tol_pct) {
+		dev_err(chip->dev,
+			"Battery ID is %d ohm, but the described battery is %u ohm +/-%u%%: not applying its charging limits\n",
+			ohm, expect_ohm, tol_pct);
+		return 0;
+	}
+
+	dev_dbg(chip->dev, "Battery ID %d ohm matches the described %u ohm\n",
+		ohm, expect_ohm);
+
+	return 1;
+}
+
+/*
  * Hardware JEITA. The hard thresholds stop charging outright and need no
  * enabling; the soft ones only do something once the corresponding
  * compensation bit is set, and then they subtract a fixed offset from the
@@ -1601,6 +1669,18 @@ static int smb_probe(struct platform_device *pdev)
 		chip->bat_therm_chan = NULL;
 	}
 
+	/*
+	 * BAT_ID likewise: only boards that can be fitted with more than one
+	 * battery have a reason to route it.
+	 */
+	chip->bat_id_chan = devm_iio_channel_get(chip->dev, "bat_id");
+	if (IS_ERR(chip->bat_id_chan)) {
+		rc = PTR_ERR(chip->bat_id_chan);
+		if (rc == -EPROBE_DEFER)
+			return rc;
+		chip->bat_id_chan = NULL;
+	}
+
 	rc = smb_init_hw(chip);
 	if (rc < 0)
 		return rc;
@@ -1657,24 +1737,38 @@ static int smb_probe(struct platform_device *pdev)
 		return dev_err_probe(chip->dev, rc, "Couldn't set vbat max\n");
 
 	/*
-	 * Let the battery say what it will take, bounded only by what the PMIC
-	 * can physically deliver. Whether that current is appropriate is a
-	 * property of the pack and of the board's thermal design, both of which
-	 * the device tree describes and this file does not know.
+	 * Everything below describes the *battery*, so none of it may be
+	 * applied to a battery that is not the one described. Where the board
+	 * gives us a way to tell, check first; a mismatch leaves the charger on
+	 * the init sequence's conservative defaults rather than on another
+	 * cell's limits.
 	 */
-	if (chip->batt_info->constant_charge_current_max_ua > 0) {
-		u32 batt_ua = chip->batt_info->constant_charge_current_max_ua;
-		unsigned int fcc_ua = min(chip->var->fcc_max_ua, batt_ua);
-
-		rc = smb_set_fast_charge_current(chip, fcc_ua);
-		if (rc < 0)
-			return dev_err_probe(chip->dev, rc,
-					     "Couldn't set the fast-charge current\n");
-	}
-
-	rc = smb_init_jeita(chip);
+	rc = smb_verify_battery_id(chip);
 	if (rc < 0)
 		return rc;
+
+	if (rc > 0) {
+		/*
+		 * Let the battery say what it will take, bounded only by what
+		 * the PMIC can physically deliver. Whether that current is
+		 * appropriate is a property of the pack and of the board's
+		 * thermal design, both of which the device tree describes and
+		 * this file does not know.
+		 */
+		if (chip->batt_info->constant_charge_current_max_ua > 0) {
+			u32 batt_ua = chip->batt_info->constant_charge_current_max_ua;
+			unsigned int fcc_ua = min(chip->var->fcc_max_ua, batt_ua);
+
+			rc = smb_set_fast_charge_current(chip, fcc_ua);
+			if (rc < 0)
+				return dev_err_probe(chip->dev, rc,
+						     "Couldn't set the fast-charge current\n");
+		}
+
+		rc = smb_init_jeita(chip);
+		if (rc < 0)
+			return rc;
+	}
 
 	rc = smb_init_cooling(chip);
 	if (rc < 0)
