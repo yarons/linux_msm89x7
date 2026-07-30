@@ -22,6 +22,7 @@
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
+#include <linux/thermal.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
@@ -447,6 +448,10 @@ struct smb_variant {
  * @bat_therm_chan:	Battery thermistor (BAT_THERM) measurement channel
  * @chg_psy:		Charger power supply instance
  * @batt_psy:		Battery (fuel-gauge) power supply instance
+ * @thermal_mitigation_ua: Fast-charge current for each thermal cooling state,
+ *			from qcom,thermal-mitigation, most permissive first
+ * @thermal_levels:	Number of entries in @thermal_mitigation_ua
+ * @thermal_level:	Cooling state currently in effect
  */
 struct smb_chip {
 	struct device *dev;
@@ -467,6 +472,10 @@ struct smb_chip {
 
 	struct power_supply *chg_psy;
 	struct power_supply *batt_psy;
+
+	u32 *thermal_mitigation_ua;
+	unsigned int thermal_levels;
+	unsigned long thermal_level;
 };
 
 static enum power_supply_property smb_properties[] = {
@@ -632,6 +641,18 @@ static int smb_get_fast_charge_current(struct smb_chip *chip, unsigned int *val)
 	       chip->var->current_scale_ua;
 
 	return 0;
+}
+
+static int smb_set_fast_charge_current(struct smb_chip *chip, unsigned int val)
+{
+	unsigned int val_raw = val / chip->var->current_scale_ua;
+
+	if (val_raw > FAST_CHARGE_CURRENT_SETTING_MASK)
+		return -EINVAL;
+
+	return regmap_update_bits(chip->regmap,
+				  chip->base + FAST_CHARGE_CURRENT_CFG,
+				  FAST_CHARGE_CURRENT_SETTING_MASK, val_raw);
 }
 
 static void smb_status_change_work(struct work_struct *work)
@@ -1366,6 +1387,123 @@ static int smb_init_jeita(struct smb_chip *chip)
 	return 0;
 }
 
+static int smb_tcd_get_max_state(struct thermal_cooling_device *tcd,
+				 unsigned long *state)
+{
+	struct smb_chip *chip = tcd->devdata;
+
+	*state = chip->thermal_levels - 1;
+
+	return 0;
+}
+
+static int smb_tcd_get_cur_state(struct thermal_cooling_device *tcd,
+				 unsigned long *state)
+{
+	struct smb_chip *chip = tcd->devdata;
+
+	*state = chip->thermal_level;
+
+	return 0;
+}
+
+static int smb_tcd_set_cur_state(struct thermal_cooling_device *tcd,
+				 unsigned long state)
+{
+	struct smb_chip *chip = tcd->devdata;
+	int rc;
+
+	if (state >= chip->thermal_levels)
+		return -EINVAL;
+
+	rc = smb_set_fast_charge_current(chip,
+					 chip->thermal_mitigation_ua[state]);
+	if (rc < 0)
+		return rc;
+
+	chip->thermal_level = state;
+
+	return 0;
+}
+
+static const struct thermal_cooling_device_ops smb_tcd_ops = {
+	.get_max_state = smb_tcd_get_max_state,
+	.get_cur_state = smb_tcd_get_cur_state,
+	.set_cur_state = smb_tcd_set_cur_state,
+};
+
+/*
+ * Expose the fast-charge current as a cooling device, so a thermal zone can
+ * throttle charging the way it throttles a CPU. State 0 is the unmitigated
+ * current the board asked for and each further state is lower.
+ *
+ * The JEITA soft-zone compensation is a fixed subtraction from whatever is
+ * programmed here, so a mitigated current stays mitigated in the soft zones
+ * too.
+ */
+static int smb_init_cooling(struct smb_chip *chip)
+{
+	struct thermal_cooling_device *tcd;
+	unsigned int fcc_ua;
+	int count, i, rc;
+
+	count = device_property_count_u32(chip->dev, "qcom,thermal-mitigation");
+	if (count == -EINVAL)
+		return 0;
+	if (count < 0)
+		return dev_err_probe(chip->dev, count,
+				     "Couldn't read qcom,thermal-mitigation\n");
+	if (count < 2)
+		return dev_err_probe(chip->dev, -EINVAL,
+				     "qcom,thermal-mitigation needs at least two states\n");
+
+	chip->thermal_mitigation_ua = devm_kcalloc(chip->dev, count,
+						   sizeof(*chip->thermal_mitigation_ua),
+						   GFP_KERNEL);
+	if (!chip->thermal_mitigation_ua)
+		return -ENOMEM;
+
+	rc = device_property_read_u32_array(chip->dev, "qcom,thermal-mitigation",
+					    chip->thermal_mitigation_ua, count);
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't read qcom,thermal-mitigation\n");
+
+	rc = smb_get_fast_charge_current(chip, &fcc_ua);
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't read the fast-charge current\n");
+
+	for (i = 1; i < count; i++)
+		if (chip->thermal_mitigation_ua[i] >
+		    chip->thermal_mitigation_ua[i - 1])
+			return dev_err_probe(chip->dev, -EINVAL,
+					     "qcom,thermal-mitigation must not increase (state %d)\n",
+					     i);
+
+	/*
+	 * Mitigation may only ever reduce. The table is written for the current
+	 * the board expects to charge at, and the charger may be running below
+	 * that - on the init-sequence default, because the fitted battery could
+	 * not be identified - in which case a state must not raise it back up.
+	 */
+	for (i = 0; i < count; i++)
+		chip->thermal_mitigation_ua[i] =
+			min(chip->thermal_mitigation_ua[i], fcc_ua);
+
+	chip->thermal_levels = count;
+
+	tcd = devm_thermal_of_cooling_device_register(chip->dev,
+						      dev_of_node(chip->dev),
+						      "qcom-smbx-charger", chip,
+						      &smb_tcd_ops);
+	if (IS_ERR(tcd))
+		return dev_err_probe(chip->dev, PTR_ERR(tcd),
+				     "Couldn't register the cooling device\n");
+
+	return 0;
+}
+
 static int smb_init_irq(struct smb_chip *chip, int *irq, const char *name,
 			 irqreturn_t (*handler)(int irq, void *data))
 {
@@ -1458,6 +1596,10 @@ static int smb_probe(struct platform_device *pdev)
 		return rc;
 
 	rc = smb_init_jeita(chip);
+	if (rc < 0)
+		return rc;
+
+	rc = smb_init_cooling(chip);
 	if (rc < 0)
 		return rc;
 
