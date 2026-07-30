@@ -1279,7 +1279,7 @@ static int smb_set_jeita_thresholds(struct smb_chip *chip,
 	int rc;
 
 	rc = fwnode_property_read_u32_array(batt, prop, thresh,
-					   ARRAY_SIZE(thresh));
+					    ARRAY_SIZE(thresh));
 	if (rc == -EINVAL)
 		return 0;
 	if (rc < 0)
@@ -1396,8 +1396,9 @@ static int smb_init_jeita(struct smb_chip *chip)
 		return rc;
 
 	rc = fwnode_property_read_u32_array(batt,
-					   "qcom,jeita-soft-fcc-microamp",
-					   soft_fcc_ua, ARRAY_SIZE(soft_fcc_ua));
+					    "qcom,jeita-soft-fcc-microamp",
+					    soft_fcc_ua,
+					    ARRAY_SIZE(soft_fcc_ua));
 	if (rc == -EINVAL)
 		return 0;
 	if (rc < 0)
@@ -1755,8 +1756,8 @@ static int smb_probe(struct platform_device *pdev)
 		 * this file does not know.
 		 */
 		if (chip->batt_info->constant_charge_current_max_ua > 0) {
-			unsigned int fcc_ua = min_t(u32, chip->var->fcc_max_ua,
-						    chip->batt_info->constant_charge_current_max_ua);
+			u32 batt_ua = chip->batt_info->constant_charge_current_max_ua;
+			unsigned int fcc_ua = min(chip->var->fcc_max_ua, batt_ua);
 
 			rc = smb_set_fast_charge_current(chip, fcc_ua);
 			if (rc < 0)
