@@ -595,6 +595,9 @@ struct smb_variant {
  * @fg_charge_seen:	A charge has actually been in progress since that input
  *			appeared, which is what makes a later inhibit mean
  *			completion rather than a top-up that was never needed
+ * @fg_charging:	The charger is driving the pack right now, so its terminal
+ *			voltage is imposed rather than chosen and says nothing
+ *			the OCV table can answer
  */
 struct smb_chip {
 	struct device *dev;
@@ -630,6 +633,7 @@ struct smb_chip {
 	bool fg_ready;
 	bool fg_full;
 	bool fg_charge_seen;
+	bool fg_charging;
 };
 
 static enum power_supply_property smb_properties[] = {
@@ -1234,6 +1238,7 @@ static bool smb_fg_track_completion(struct smb_chip *chip)
 	if (!online) {
 		chip->fg_full = false;
 		chip->fg_charge_seen = false;
+		chip->fg_charging = false;
 		return false;
 	}
 
@@ -1242,10 +1247,12 @@ static bool smb_fg_track_completion(struct smb_chip *chip)
 		return chip->fg_full;
 
 	code = status & BATTERY_CHARGER_STATUS_MASK;
+	chip->fg_charging = chip->var->charge_status[code] ==
+			    POWER_SUPPLY_STATUS_CHARGING;
+
 	if (code == CHARGE_STATUS_TERMINATE) {
 		chip->fg_full = true;
-	} else if (chip->var->charge_status[code] ==
-		   POWER_SUPPLY_STATUS_CHARGING) {
+	} else if (chip->fg_charging) {
 		chip->fg_charge_seen = true;
 		chip->fg_full = false;
 	} else if (code == chip->var->inhibit_code && chip->fg_charge_seen) {
@@ -1307,7 +1314,20 @@ static bool smb_fg_update(struct smb_chip *chip)
 	if (soc_ocv < 0)
 		return false;
 
-	if (abs(i_ua) <= SMB_FG_OCV_QUIET_UA)
+	/*
+	 * A charger in its constant-voltage phase holds the terminal at the
+	 * float voltage and lets the current decay, so what the ADC reads
+	 * there is the charger's number and not the cell's. Subtracting I*R
+	 * does not recover an open-circuit voltage from it - the current is
+	 * small by then, a few millivolts' worth - and the table, asked about
+	 * a voltage above its top entry, answers a hundred percent while the
+	 * pack is still filling. Count charge and nothing else while the
+	 * charger is driving; the completion the charger reports is what ends
+	 * that, and it is the honest hundred percent.
+	 */
+	if (chip->fg_charging)
+		weight = 0;
+	else if (abs(i_ua) <= SMB_FG_OCV_QUIET_UA)
 		weight = SMB_FG_OCV_WEIGHT_QUIET;
 	else if (abs(i_ua) <= SMB_FG_OCV_SETTLED_UA)
 		weight = SMB_FG_OCV_WEIGHT_SETTLED;
@@ -1319,13 +1339,18 @@ static bool smb_fg_update(struct smb_chip *chip)
 	elapsed_ms = ktime_ms_delta(now, chip->fg_last);
 	was = chip->fg_ready ? chip->soc_permyriad : -1;
 
-	if (!chip->fg_ready || elapsed_ms > SMB_FG_STALE_MS) {
+	if (!chip->fg_ready ||
+	    (elapsed_ms > SMB_FG_STALE_MS && !chip->fg_charging)) {
 		/*
 		 * A gap this long means the system was suspended, so the
 		 * sample says nothing about what happened during it. A
 		 * suspended phone is also a rested battery, which is the one
 		 * condition where the OCV table needs no help at all - take it
 		 * outright rather than integrating a current nobody drew.
+		 *
+		 * Unless it suspended on a charger, which is the exception: a
+		 * cell being held at the float voltage is the least rested it
+		 * ever gets, whatever the CPU was doing.
 		 */
 		chip->soc_permyriad = soc_ocv;
 		chip->fg_residue = 0;
