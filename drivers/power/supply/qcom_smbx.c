@@ -75,6 +75,14 @@
 #define I_TERM_BIT					BIT(3)
 #define AUTO_RECHG_BIT					BIT(2)
 #define EN_ANALOG_DROP_IN_VBATT_BIT			BIT(1)
+/*
+ * Where SMB2 has the two bits above, SMB5 has a single two-bit field naming
+ * what restarts a finished charge: 0 nothing, BIT(2) the battery voltage,
+ * both bits the state of charge (smb5-reg.h RECHG_MASK / VBAT_BASED_RECHG_BIT
+ * / SOC_BASED_RECHG_BIT).
+ */
+#define SMB5_RECHG_MASK					GENMASK(2, 1)
+#define SMB5_VBAT_BASED_RECHG_BIT			BIT(2)
 #define CHARGER_INHIBIT_BIT				BIT(0)
 
 #define PRE_CHARGE_CURRENT_CFG				0x60
@@ -83,8 +91,21 @@
 #define FAST_CHARGE_CURRENT_CFG				0x61
 #define FAST_CHARGE_CURRENT_SETTING_MASK		GENMASK(7, 0)
 
+/*
+ * SMB5 only: how many comparator samples a recharge decision takes, and the
+ * battery-voltage threshold it compares against, in the same 194637 nV units
+ * the gauge reports (smb5-reg.h CHGR_NO_SAMPLE_TERM_RCHG_CFG_REG and
+ * CHGR_ADC_RECHARGE_THRESHOLD_MSB/LSB_REG).
+ */
+#define NO_SAMPLE_TERM_RCHG_CFG				0x6B
+#define NO_OF_SAMPLE_FOR_RCHG				GENMASK(3, 2)
+#define NO_OF_SAMPLE_FOR_RCHG_SHIFT			2
+
 #define FLOAT_VOLTAGE_CFG				0x70
 #define FLOAT_VOLTAGE_SETTING_MASK			GENMASK(7, 0)
+
+#define ADC_RECHARGE_THRESHOLD_MSB			0x7E
+#define ADC_RECHARGE_THRESHOLD_LSB			0x7F
 
 #define FG_UPDATE_CFG_2_SEL				0x7D
 #define SOC_LT_OTG_THRESH_SEL_BIT			BIT(3)
@@ -502,6 +523,9 @@ struct smb_init_register {
  *			(BIT(5) on SMB2, BIT(1) on SMB5)
  * @charge_status:	What each of the eight BATTERY_CHARGER_STATUS_1 codes
  *			means on this generation, see smb2_charge_status
+ * @rechg_thresh_reg:	Register holding the battery-voltage recharge threshold,
+ *			relative to @base, or 0 where this generation does not
+ *			express one this way (SMB2)
  * @inhibit_code:	Which of those codes is charge inhibit - the state a
  *			finished charge settles into once the cell is above the
  *			recharge threshold (6 on SMB2, 0 on SMB5)
@@ -527,6 +551,7 @@ struct smb_variant {
 	u32 float_step_uv;
 	u8 ov_bit;
 	const u8 *charge_status;
+	u16 rechg_thresh_reg;
 	u8 inhibit_code;
 	u16 temp_status_reg;
 	u8 temp_status_shift;
@@ -1644,13 +1669,33 @@ static const struct smb_init_register pmi632_init_seq[] = {
 	{ .addr = CHARGING_ENABLE_CMD,
 	  .mask = CHARGING_ENABLE_CMD_BIT,
 	  .val = CHARGING_ENABLE_CMD_BIT },
-	/* Charger enable controlled by software; inhibit based on battery voltage */
+	/*
+	 * Charger enable controlled by software, inhibit based on battery
+	 * voltage, and recharge on the battery voltage too.
+	 *
+	 * ☠️ Bits 2 and 1 of this register are not what SMB2 puts there. On
+	 * SMB5 they are a two-bit field naming what a finished charge is
+	 * restarted by - clear for nothing at all, BIT(2) for the battery
+	 * voltage, both bits for the state of charge - where SMB2 has
+	 * AUTO_RECHG and EN_ANALOG_DROP_IN_VBATT. Carrying the SMB2 value
+	 * across therefore left the field clear, which is the one setting that
+	 * means a charge that has terminated is never restarted for as long as
+	 * the cable stays in. The state of charge is not an option here in any
+	 * case: the gauge that would report one to the PMIC is Qualcomm's own,
+	 * and it is not part of this driver.
+	 */
 	{ .addr = CHGR_CFG2,
 	  .mask = CHG_EN_SRC_BIT | CHG_EN_POLARITY_BIT |
 		  PRETOFAST_TRANSITION_CFG_BIT | BAT_OV_ECC_BIT | I_TERM_BIT |
-		  AUTO_RECHG_BIT | EN_ANALOG_DROP_IN_VBATT_BIT |
-		  CHARGER_INHIBIT_BIT,
-	  .val = CHARGER_INHIBIT_BIT },
+		  SMB5_RECHG_MASK | CHARGER_INHIBIT_BIT,
+	  .val = SMB5_VBAT_BASED_RECHG_BIT | CHARGER_INHIBIT_BIT },
+	/*
+	 * Take three samples before acting on the voltage comparator, which is
+	 * what the vendor driver asks for whenever it selects VBAT recharge.
+	 */
+	{ .addr = NO_SAMPLE_TERM_RCHG_CFG,
+	  .mask = NO_OF_SAMPLE_FOR_RCHG,
+	  .val = 3 << NO_OF_SAMPLE_FOR_RCHG_SHIFT },
 	/* Default SDP charger to a 500mA USB 2.0 port */
 	{ .addr = USBIN_ICL_OPTIONS,
 	  .mask = USB51_MODE_BIT | USBIN_MODE_CHG_BIT,
@@ -1729,6 +1774,7 @@ static const struct smb_variant smb_variant_pmi632 = {
 	.float_step_uv = 10000,
 	.ov_bit = SMB5_CHARGER_ERROR_STATUS_BAT_OV_BIT,
 	.charge_status = smb5_charge_status,
+	.rechg_thresh_reg = ADC_RECHARGE_THRESHOLD_MSB,
 	.inhibit_code = 0,
 	/*
 	 * On SMB5 the JEITA temperature-status bits moved out of
@@ -1795,6 +1841,59 @@ static int smb_set_jeita_thresholds(struct smb_chip *chip,
 	rc = regmap_bulk_write(chip->regmap, chip->base + reg, buf, sizeof(buf));
 	if (rc < 0)
 		return dev_err_probe(chip->dev, rc, "Couldn't write %s\n", prop);
+
+	return 0;
+}
+
+/**
+ * smb_set_recharge_threshold() - tell the charger when to top the pack up again
+ * @chip: the charger
+ *
+ * The recharge comparator has been pointed at the battery voltage by the init
+ * sequence; this is the voltage it compares against. Where the board does not
+ * name one the hardware default is left alone - a comparator watching the right
+ * quantity at whatever threshold it powers up with is still a working
+ * comparator, and inventing a threshold for an unknown cell is not an
+ * improvement on that.
+ *
+ * The value is in the same 194637 nV units the gauge reports, which is not a
+ * coincidence: it is the same ADC.
+ *
+ * Returns: 0, or negative on error.
+ */
+static int smb_set_recharge_threshold(struct smb_chip *chip)
+{
+	struct fwnode_handle *batt __free(fwnode_handle) =
+		fwnode_find_reference(dev_fwnode(chip->dev),
+				      "monitored-battery", 0);
+	u32 uv, raw;
+	int rc;
+
+	if (!chip->var->rechg_thresh_reg)
+		return 0;
+
+	if (IS_ERR(batt) ||
+	    fwnode_property_read_u32(batt, "qcom,auto-recharge-microvolt", &uv))
+		return 0;
+
+	if (uv >= chip->batt_info->voltage_max_design_uv) {
+		dev_warn(chip->dev,
+			 "recharge threshold %u uV is not below the float voltage, ignoring\n",
+			 uv);
+		return 0;
+	}
+
+	raw = div_u64((u64)uv * 1000, QG_V_LSB_NV);
+
+	rc = regmap_write(chip->regmap, chip->base + chip->var->rechg_thresh_reg,
+			  raw >> 8);
+	if (!rc)
+		rc = regmap_write(chip->regmap,
+				  chip->base + chip->var->rechg_thresh_reg + 1,
+				  raw & 0xff);
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't set the recharge threshold\n");
 
 	return 0;
 }
@@ -2240,6 +2339,10 @@ static int smb_probe(struct platform_device *pdev)
 				FLOAT_VOLTAGE_SETTING_MASK, rc);
 	if (rc < 0)
 		return dev_err_probe(chip->dev, rc, "Couldn't set vbat max\n");
+
+	rc = smb_set_recharge_threshold(chip);
+	if (rc < 0)
+		return rc;
 
 	/*
 	 * Everything below describes the *battery*, so none of it may be
