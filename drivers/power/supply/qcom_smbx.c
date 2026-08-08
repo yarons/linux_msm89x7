@@ -14,8 +14,10 @@
 #include <linux/iio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeirq.h>
 #include <linux/of.h>
@@ -23,6 +25,7 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/thermal.h>
+#include <linux/timekeeping.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
@@ -375,6 +378,48 @@
 #define STAT_FUNCTION_CFG_BIT				BIT(1)
 #define STAT_IRQ_PULSING_EN_BIT				BIT(0)
 
+/*
+ * Fuel-gauge (QG) peripheral, present on SMB5 PMICs. Its base is absolute
+ * inside the PMIC rather than relative to the charger's own base, and is
+ * carried in smb_variant::qg_base. The offsets and the LSB sizes below are
+ * the downstream qpnp-qg driver's (qg-reg.h, qg-defs.h).
+ *
+ * This driver only ever reads the peripheral: the PMIC's own boot sequence
+ * starts the gauge, so the sample registers are live without anything here
+ * configuring them. Verified on a Fairphone 3 running this driver, where the
+ * ADC registers track a load step within one sample period.
+ */
+#define QG_S7_PON_OCV_V_DATA0				0x70
+#define QG_S7_PON_OCV_I_DATA0				0x72
+#define QG_S3_GOOD_OCV_V_DATA0				0x74
+#define QG_S3_GOOD_OCV_I_DATA0				0x76
+#define QG_LAST_ADC_V_DATA0				0xc0
+#define QG_LAST_ADC_I_DATA0				0xc2
+
+/* Both sample registers read back as 0x8000 while they hold no measurement */
+#define QG_ADC_INVALID					0x8000
+/* nV per LSB of the voltage ADC, nA per LSB of the current ADC */
+#define QG_V_LSB_NV					194637
+#define QG_I_LSB_NA					152588
+
+/*
+ * How often the gauge integrates, and the currents at which an open-circuit
+ * voltage reading is trusted enough to correct the integral. The wider band
+ * still carries an IR error of a few millivolts, which is why it only nudges;
+ * the narrow one is small enough to steer with.
+ */
+#define SMB_FG_POLL_MS					10000
+#define SMB_FG_OCV_QUIET_UA				50000
+#define SMB_FG_OCV_SETTLED_UA				150000
+#define SMB_FG_OCV_WEIGHT_QUIET				25
+#define SMB_FG_OCV_WEIGHT_SETTLED			3
+/*
+ * A poll this late means the CPU was suspended rather than merely busy, so
+ * the last current sample says nothing about the interval. Re-anchor on the
+ * open-circuit voltage instead, which a rested battery reports accurately.
+ */
+#define SMB_FG_STALE_MS					60000
+
 #define SDP_CURRENT_UA					500000
 #define CDP_CURRENT_UA					1500000
 #define DCP_CURRENT_UA					1500000
@@ -424,6 +469,8 @@ struct smb_init_register {
  *			bits versus the SMB2 baseline (0 on SMB2, 2 on SMB5)
  * @init_seq:		HW init register write sequence for this generation
  * @init_seq_len:	Number of entries in @init_seq
+ * @qg_base:		Absolute base of the QG fuel-gauge peripheral, or 0 on
+ *			a PMIC where this driver has no gauge to read
  *
  * All values are taken from the Qualcomm downstream qpnp-smb2 / qpnp-smb5
  * drivers (smb_chg_param tables) so the current/voltage scaling is exact.
@@ -440,6 +487,7 @@ struct smb_variant {
 	u8 temp_status_shift;
 	const struct smb_init_register *init_seq;
 	int init_seq_len;
+	u16 qg_base;
 };
 
 /**
@@ -464,6 +512,13 @@ struct smb_variant {
  *			from qcom,thermal-mitigation, most permissive first
  * @thermal_levels:	Number of entries in @thermal_mitigation_ua
  * @thermal_level:	Cooling state currently in effect
+ * @fg_work:		Worker that integrates the fuel gauge, see smb_fg_work()
+ * @fg_lock:		Serialises @soc_permyriad and @fg_last against readers
+ * @soc_permyriad:	State of charge in hundredths of a percent
+ * @fg_residue:		Charge counted but too small to have moved
+ *			@soc_permyriad yet, in microamp-milliseconds
+ * @fg_last:		When the gauge last integrated
+ * @fg_ready:		Set once @soc_permyriad holds a real estimate
  */
 struct smb_chip {
 	struct device *dev;
@@ -489,6 +544,14 @@ struct smb_chip {
 	u32 *thermal_mitigation_ua;
 	unsigned int thermal_levels;
 	unsigned long thermal_level;
+
+	struct delayed_work fg_work;
+	/* Serialises the gauge state below against readers of it */
+	struct mutex fg_lock;
+	int soc_permyriad;
+	s64 fg_residue;
+	ktime_t fg_last;
+	bool fg_ready;
 };
 
 static enum power_supply_property smb_properties[] = {
@@ -915,12 +978,24 @@ static irqreturn_t smb_handle_wdog_bark(int irq, void *data)
 /*
  * Battery (fuel-gauge) power supply.
  *
- * PMI632 has no coulomb-counting fuel gauge in mainline; the downstream
- * QG block is a voltage-based gauge. We replicate the essential algorithm:
- * read VBAT_SNS via the PMIC ADC and look up the state-of-charge from the
- * OCV->capacity table carried in the monitored-battery DT node (which was
- * extracted from the downstream QG battery profile). The power-supply core
- * does the interpolation. Reading is non-invasive (ADC only).
+ * The state of charge is carried in the OCV->capacity table of the
+ * monitored-battery node, which is the downstream QG battery profile. That
+ * table maps an *open-circuit* voltage, so what is fed into it decides how
+ * good the answer is: the battery's terminal voltage moves by hundreds of
+ * millivolts with load, while the same table spans eighteen points of charge
+ * over the forty millivolts between 3.80 V and 3.84 V. Reading the terminal
+ * voltage into it therefore does not give a poor estimate, it gives a meter
+ * that tracks the CPU rather than the battery.
+ *
+ * So the terminal voltage is not what this gauge reports. On a PMIC with a QG
+ * peripheral we have both the battery voltage and the battery current from
+ * the same converter, and the two together support the usual arrangement:
+ * integrate the current continuously, and correct that integral against the
+ * OCV table only while the current is small enough for the IR term to be
+ * worth trusting. The result no longer moves under load, because a load does
+ * not change how much charge is in the cell.
+ *
+ * Reading is non-invasive: ADC channels and QG sample registers only.
  */
 static enum power_supply_property smb_batt_properties[] = {
 	POWER_SUPPLY_PROP_STATUS,
@@ -929,8 +1004,76 @@ static enum power_supply_property smb_batt_properties[] = {
 	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_CAPACITY,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_VOLTAGE_OCV,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_TEMP,
 };
+
+/**
+ * smb_qg_read_sample() - read one QG voltage/current sample register pair
+ * @chip: charger
+ * @v_off: in-peripheral offset of the voltage half of the pair
+ * @v_uv: where to put the voltage, in microvolts
+ * @i_ua: where to put the current, in microamps, positive while charging
+ *
+ * The pairs are always voltage then current two registers apart. The gauge
+ * reports current negative into the battery; this returns it the way the
+ * power-supply class states it, positive while charging.
+ *
+ * Return: 0, or -ENODATA when the pair holds no measurement.
+ */
+static int smb_qg_read_sample(struct smb_chip *chip, unsigned int v_off,
+			      int *v_uv, int *i_ua)
+{
+	u8 buf[4];
+	u16 v_raw;
+	s16 i_raw;
+	int rc;
+
+	rc = regmap_bulk_read(chip->regmap, chip->var->qg_base + v_off, buf,
+			      sizeof(buf));
+	if (rc < 0)
+		return rc;
+
+	v_raw = get_unaligned_le16(&buf[0]);
+	i_raw = get_unaligned_le16(&buf[2]);
+
+	if (v_raw == QG_ADC_INVALID)
+		return -ENODATA;
+
+	/*
+	 * Both products run past two billion at ordinary readings - a 3.9 V
+	 * battery is already 4.0e9 nV - so neither may be evaluated in an int.
+	 */
+	*v_uv = (int)div_u64((u64)v_raw * QG_V_LSB_NV + 500, 1000);
+	*i_ua = -(int)div_s64((s64)i_raw * QG_I_LSB_NA, 1000);
+
+	return 0;
+}
+
+/*
+ * The battery's internal resistance, so an open-circuit voltage can be
+ * recovered from a loaded one. Both DT properties are optional; without them
+ * the gauge simply confines itself to samples taken at a current low enough
+ * for the correction not to matter.
+ */
+static int smb_batt_resistance_uohm(struct smb_chip *chip, int i_ua)
+{
+	int r = chip->batt_info->factory_internal_resistance_uohm;
+
+	if (i_ua > 0 && chip->batt_info->factory_internal_resistance_charging_uohm > 0)
+		r = chip->batt_info->factory_internal_resistance_charging_uohm;
+
+	return r > 0 ? r : 0;
+}
+
+/* Open-circuit voltage behind a terminal voltage loaded with @i_ua */
+static int smb_batt_ocv(struct smb_chip *chip, int v_uv, int i_ua)
+{
+	s64 ir_uv = (s64)i_ua * smb_batt_resistance_uohm(chip, i_ua);
+
+	return v_uv - (int)div_s64(ir_uv, 1000000);
+}
 
 static int smb_get_vbat(struct smb_chip *chip, int *val)
 {
@@ -957,29 +1100,262 @@ static int smb_get_batt_temp(struct smb_chip *chip, int *val)
 	return 0;
 }
 
+/*
+ * Whether this board can be gauged by integration: a PMIC with the peripheral
+ * to sample the current, and a pack size to integrate the current against. The
+ * second is what the charge-to-percent division divides by, so it has to be a
+ * real one.
+ */
+static bool smb_fg_available(struct smb_chip *chip)
+{
+	return chip->var->qg_base && chip->batt_info &&
+	       chip->batt_info->charge_full_design_uah > 0;
+}
+
+/* Capacity, in hundredths of a percent, of an open-circuit voltage */
+static int smb_ocv_to_permyriad(struct smb_chip *chip, int ocv_uv)
+{
+	/* The single table we carry characterises the cell at 25 degC */
+	int cap = power_supply_batinfo_ocv2cap(chip->batt_info, ocv_uv, 25);
+
+	if (cap < 0)
+		return cap;
+
+	return clamp(cap, 0, 100) * 100;
+}
+
+/**
+ * smb_fg_work() - integrate the fuel gauge over one poll interval
+ * @work: the delayed work in struct smb_chip
+ *
+ * Charge counting is what keeps the reported capacity still while the load
+ * moves, but on its own it only ever accumulates error, so it is steered by
+ * the OCV table whenever the current is low enough for the table to be worth
+ * more than the integral. The two currents that gate that are deliberately
+ * far below what this phone draws when it is awake and doing something: the
+ * intent is to correct while it idles or charges gently, and to coast on the
+ * integral the rest of the time.
+ */
+static bool smb_fg_update(struct smb_chip *chip)
+{
+	int v_uv, i_ua, ocv_uv, soc_ocv, status, was, weight;
+	ktime_t now = ktime_get_boottime();
+	s64 elapsed_ms;
+
+	if (smb_qg_read_sample(chip, QG_LAST_ADC_V_DATA0, &v_uv, &i_ua) < 0)
+		return false;
+
+	/*
+	 * Termination is the one point on the curve the charger knows better
+	 * than any gauge: it stopped because the cell reached the float
+	 * voltage at below the termination current, which is what full means.
+	 * Take it, rather than leaving the integral a few percent short of a
+	 * battery that will not accept any more.
+	 */
+	if (!smb_get_prop_status(chip, &status) &&
+	    status == POWER_SUPPLY_STATUS_FULL) {
+		guard(mutex)(&chip->fg_lock);
+
+		was = chip->fg_ready ? chip->soc_permyriad : -1;
+		chip->soc_permyriad = 100 * 100;
+		chip->fg_residue = 0;
+		chip->fg_ready = true;
+		chip->fg_last = now;
+
+		return was != chip->soc_permyriad;
+	}
+
+	ocv_uv = smb_batt_ocv(chip, v_uv, i_ua);
+	soc_ocv = smb_ocv_to_permyriad(chip, ocv_uv);
+	if (soc_ocv < 0)
+		return false;
+
+	if (abs(i_ua) <= SMB_FG_OCV_QUIET_UA)
+		weight = SMB_FG_OCV_WEIGHT_QUIET;
+	else if (abs(i_ua) <= SMB_FG_OCV_SETTLED_UA)
+		weight = SMB_FG_OCV_WEIGHT_SETTLED;
+	else
+		weight = 0;
+
+	guard(mutex)(&chip->fg_lock);
+
+	elapsed_ms = ktime_ms_delta(now, chip->fg_last);
+	was = chip->fg_ready ? chip->soc_permyriad : -1;
+
+	if (!chip->fg_ready || elapsed_ms > SMB_FG_STALE_MS) {
+		/*
+		 * A gap this long means the system was suspended, so the
+		 * sample says nothing about what happened during it. A
+		 * suspended phone is also a rested battery, which is the one
+		 * condition where the OCV table needs no help at all - take it
+		 * outright rather than integrating a current nobody drew.
+		 */
+		chip->soc_permyriad = soc_ocv;
+		chip->fg_residue = 0;
+		chip->fg_ready = true;
+	} else {
+		/*
+		 * charge (uAh) = i_ua * elapsed / 3600, and one percent of the
+		 * pack is charge_full_design_uah / 100, so a hundredth of a
+		 * percent per millisecond is i_ua * elapsed_ms / (360 * full).
+		 *
+		 * At a tenth of an amp that quotient is under one per poll, so
+		 * carry the undivided remainder rather than rounding it away:
+		 * discarded it would be a standing error in the rate itself,
+		 * always in the direction of counting too little.
+		 */
+		s64 per_permyriad = 360LL * chip->batt_info->charge_full_design_uah;
+		s64 step;
+
+		chip->fg_residue += (s64)i_ua * elapsed_ms;
+		step = div_s64(chip->fg_residue, per_permyriad);
+		chip->fg_residue -= step * per_permyriad;
+
+		chip->soc_permyriad += step;
+		chip->soc_permyriad += (soc_ocv - chip->soc_permyriad) * weight / 100;
+		chip->soc_permyriad = clamp(chip->soc_permyriad, 0, 100 * 100);
+	}
+
+	chip->fg_last = now;
+
+	dev_dbg(chip->dev, "fg: %d.%02d%% vbat=%duV ibat=%duA ocv=%duV w=%d\n",
+		chip->soc_permyriad / 100, chip->soc_permyriad % 100, v_uv,
+		i_ua, ocv_uv, weight);
+
+	return DIV_ROUND_CLOSEST(chip->soc_permyriad, 100) !=
+	       DIV_ROUND_CLOSEST(was, 100);
+}
+
+static void smb_fg_work(struct work_struct *work)
+{
+	struct smb_chip *chip = container_of(work, struct smb_chip,
+					     fg_work.work);
+
+	if (smb_fg_update(chip))
+		power_supply_changed(chip->batt_psy);
+
+	schedule_delayed_work(&chip->fg_work, msecs_to_jiffies(SMB_FG_POLL_MS));
+}
+
+/**
+ * smb_fg_start() - seed the fuel gauge and start integrating it
+ * @chip: charger
+ *
+ * An integrating gauge is only ever as good as what it started from, and the
+ * live sample is a poor start: at probe the machine is booting, which is the
+ * least rested the battery gets. The gauge itself has a better answer already
+ * measured. It samples an open-circuit voltage twice under conditions we
+ * cannot recreate here - once at power-on before anything draws, and again
+ * whenever the PMIC has seen the current stay near zero for long enough - and
+ * keeps both. Take the second in preference to the first, since the first can
+ * be arbitrarily old, and fall back to the live sample if the PMIC holds
+ * neither.
+ */
+static int smb_fg_start(struct smb_chip *chip)
+{
+	static const unsigned int rest_ocv[] = {
+		QG_S3_GOOD_OCV_V_DATA0,
+		QG_S7_PON_OCV_V_DATA0,
+	};
+	int v_uv, i_ua, soc, rc, i;
+
+	rc = devm_mutex_init(chip->dev, &chip->fg_lock);
+	if (rc)
+		return rc;
+
+	for (i = 0; i < ARRAY_SIZE(rest_ocv); i++) {
+		if (smb_qg_read_sample(chip, rest_ocv[i], &v_uv, &i_ua) < 0)
+			continue;
+
+		soc = smb_ocv_to_permyriad(chip, smb_batt_ocv(chip, v_uv, i_ua));
+		if (soc < 0)
+			continue;
+
+		chip->soc_permyriad = soc;
+		chip->fg_ready = true;
+		/* so the first poll integrates rather than re-anchoring */
+		chip->fg_last = ktime_get_boottime();
+		dev_dbg(chip->dev, "fg: seeded at %d.%02d%% from %duV\n",
+			soc / 100, soc % 100, v_uv);
+		break;
+	}
+
+	rc = devm_delayed_work_autocancel(chip->dev, &chip->fg_work,
+					  smb_fg_work);
+	if (rc)
+		return dev_err_probe(chip->dev, rc,
+				     "Failed to init fuel-gauge work\n");
+
+	schedule_delayed_work(&chip->fg_work, 0);
+	return 0;
+}
+
 static int smb_get_batt_capacity(struct smb_chip *chip, int *val)
 {
-	int ocv_uv, cap, rc;
+	int v_uv, cap, rc;
 
 	if (!chip->batt_info)
 		return -ENODATA;
 
-	rc = smb_get_vbat(chip, &ocv_uv);
+	if (smb_fg_available(chip)) {
+		guard(mutex)(&chip->fg_lock);
+
+		if (!chip->fg_ready)
+			return -EAGAIN;
+
+		*val = DIV_ROUND_CLOSEST(chip->soc_permyriad, 100);
+		return 0;
+	}
+
+	/*
+	 * Without a gauge to integrate there is nothing to feed the OCV table
+	 * but the terminal voltage, load and all - see the caveat above
+	 * smb_batt_properties for what that costs.
+	 */
+	rc = smb_get_vbat(chip, &v_uv);
 	if (rc < 0)
 		return rc;
 
-	/*
-	 * Use the instantaneous battery voltage as the OCV estimate. Under
-	 * load this sags (reads low while discharging, high while charging);
-	 * a future ESR/IR-drop compensation could refine it. Assume room
-	 * temperature (25 degC), matching the single OCV table we ship.
-	 */
-	cap = power_supply_batinfo_ocv2cap(chip->batt_info, ocv_uv, 25);
+	cap = power_supply_batinfo_ocv2cap(chip->batt_info, v_uv, 25);
 	if (cap < 0)
 		return cap;
 
 	*val = clamp(cap, 0, 100);
 	return 0;
+}
+
+static int smb_get_batt_current(struct smb_chip *chip, int *val)
+{
+	int v_uv;
+
+	if (!chip->var->qg_base)
+		return -ENODATA;
+
+	return smb_qg_read_sample(chip, QG_LAST_ADC_V_DATA0, &v_uv, val);
+}
+
+static int smb_get_batt_voltage(struct smb_chip *chip, bool open_circuit,
+				int *val)
+{
+	int v_uv, i_ua, rc;
+
+	/*
+	 * Prefer the gauge's own converter over the ADC channel: it measures
+	 * the voltage and the current at the same instant, which is what makes
+	 * the pair of them usable together.
+	 */
+	if (chip->var->qg_base) {
+		rc = smb_qg_read_sample(chip, QG_LAST_ADC_V_DATA0, &v_uv, &i_ua);
+		if (!rc) {
+			*val = open_circuit ? smb_batt_ocv(chip, v_uv, i_ua) : v_uv;
+			return 0;
+		}
+	}
+
+	if (open_circuit)
+		return -ENODATA;
+
+	return smb_get_vbat(chip, val);
 }
 
 static int smb_batt_get_property(struct power_supply *psy,
@@ -1002,7 +1378,11 @@ static int smb_batt_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CAPACITY:
 		return smb_get_batt_capacity(chip, &val->intval);
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
-		return smb_get_vbat(chip, &val->intval);
+		return smb_get_batt_voltage(chip, false, &val->intval);
+	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
+		return smb_get_batt_voltage(chip, true, &val->intval);
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+		return smb_get_batt_current(chip, &val->intval);
 	case POWER_SUPPLY_PROP_TEMP:
 		return smb_get_batt_temp(chip, &val->intval);
 	default:
@@ -1243,6 +1623,7 @@ static const struct smb_variant smb_variant_pmi632 = {
 	.temp_status_shift = 2,
 	.init_seq = pmi632_init_seq,
 	.init_seq_len = ARRAY_SIZE(pmi632_init_seq),
+	.qg_base = 0x4800,
 };
 
 static int smb_init_hw(struct smb_chip *chip)
@@ -1721,6 +2102,12 @@ static int smb_probe(struct platform_device *pdev)
 		if (IS_ERR(chip->batt_psy))
 			return dev_err_probe(chip->dev, PTR_ERR(chip->batt_psy),
 					     "failed to register battery power supply\n");
+
+		if (smb_fg_available(chip)) {
+			rc = smb_fg_start(chip);
+			if (rc < 0)
+				return rc;
+		}
 	}
 
 	rc = devm_delayed_work_autocancel(chip->dev, &chip->status_change_work,
