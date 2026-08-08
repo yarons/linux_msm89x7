@@ -441,6 +441,12 @@
  * the recharge threshold. Pause is not - it is a charge that stopped for a
  * reason of its own.
  */
+/*
+ * Charge completion, the one code both generations put at the same value and
+ * the only one that says the charger stopped because the battery is full.
+ */
+#define CHARGE_STATUS_TERMINATE				5
+
 static const u8 smb2_charge_status[8] = {
 	POWER_SUPPLY_STATUS_CHARGING,		/* 0 trickle */
 	POWER_SUPPLY_STATUS_CHARGING,		/* 1 pre */
@@ -453,7 +459,14 @@ static const u8 smb2_charge_status[8] = {
 };
 
 static const u8 smb5_charge_status[8] = {
-	POWER_SUPPLY_STATUS_FULL,		/* 0 inhibit */
+	/*
+	 * Inhibit is where SMB2 reports full, but on SMB5 it is also where a
+	 * charger sits whenever it is being held off, and this one was found
+	 * inhibiting at 4.30 V of a 4.39 V float with six percent still to
+	 * go. Not charging is the most this state supports saying; charge
+	 * completion has its own code below.
+	 */
+	POWER_SUPPLY_STATUS_NOT_CHARGING,	/* 0 inhibit */
 	POWER_SUPPLY_STATUS_CHARGING,		/* 1 trickle */
 	POWER_SUPPLY_STATUS_CHARGING,		/* 2 pre */
 	POWER_SUPPLY_STATUS_CHARGING,		/* 3 full-on */
@@ -1151,7 +1164,8 @@ static int smb_ocv_to_permyriad(struct smb_chip *chip, int ocv_uv)
  */
 static bool smb_fg_update(struct smb_chip *chip)
 {
-	int v_uv, i_ua, ocv_uv, soc_ocv, status, was, weight;
+	unsigned int status;
+	int v_uv, i_ua, ocv_uv, soc_ocv, was, weight;
 	ktime_t now = ktime_get_boottime();
 	s64 elapsed_ms;
 
@@ -1164,9 +1178,14 @@ static bool smb_fg_update(struct smb_chip *chip)
 	 * voltage at below the termination current, which is what full means.
 	 * Take it, rather than leaving the integral a few percent short of a
 	 * battery that will not accept any more.
+	 *
+	 * This asks the register for that one code rather than asking for the
+	 * reported status, because more than one state reports as full and
+	 * only this one is evidence of a finished charge.
 	 */
-	if (!smb_get_prop_status(chip, &status) &&
-	    status == POWER_SUPPLY_STATUS_FULL) {
+	if (!regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_1,
+			 &status) &&
+	    (status & BATTERY_CHARGER_STATUS_MASK) == CHARGE_STATUS_TERMINATE) {
 		guard(mutex)(&chip->fg_lock);
 
 		was = chip->fg_ready ? chip->soc_permyriad : -1;
