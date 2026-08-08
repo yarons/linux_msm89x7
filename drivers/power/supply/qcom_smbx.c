@@ -461,10 +461,12 @@ static const u8 smb2_charge_status[8] = {
 static const u8 smb5_charge_status[8] = {
 	/*
 	 * Inhibit is where SMB2 reports full, but on SMB5 it is also where a
-	 * charger sits whenever it is being held off, and this one was found
-	 * inhibiting at 4.30 V of a 4.39 V float with six percent still to
-	 * go. Not charging is the most this state supports saying; charge
-	 * completion has its own code below.
+	 * charger sits whenever it is being held off - including with a cell
+	 * that was already above the recharge threshold when the cable went
+	 * in and so was never charged at all. Not charging is the most the
+	 * code alone supports saying; smb_get_prop_status() upgrades it to
+	 * full where the gauge watched the charge that led into it, and
+	 * charge completion has its own code below.
 	 */
 	POWER_SUPPLY_STATUS_NOT_CHARGING,	/* 0 inhibit */
 	POWER_SUPPLY_STATUS_CHARGING,		/* 1 trickle */
@@ -500,6 +502,9 @@ struct smb_init_register {
  *			(BIT(5) on SMB2, BIT(1) on SMB5)
  * @charge_status:	What each of the eight BATTERY_CHARGER_STATUS_1 codes
  *			means on this generation, see smb2_charge_status
+ * @inhibit_code:	Which of those codes is charge inhibit - the state a
+ *			finished charge settles into once the cell is above the
+ *			recharge threshold (6 on SMB2, 0 on SMB5)
  * @temp_status_reg:	Register holding the JEITA temperature-status bits,
  *			relative to @base (BATTERY_CHARGER_STATUS_2 = 0x07 on
  *			SMB2, BATTERY_CHARGER_STATUS_7 = 0x0D on SMB5)
@@ -522,6 +527,7 @@ struct smb_variant {
 	u32 float_step_uv;
 	u8 ov_bit;
 	const u8 *charge_status;
+	u8 inhibit_code;
 	u16 temp_status_reg;
 	u8 temp_status_shift;
 	const struct smb_init_register *init_seq;
@@ -558,6 +564,12 @@ struct smb_variant {
  *			@soc_permyriad yet, in microamp-milliseconds
  * @fg_last:		When the gauge last integrated
  * @fg_ready:		Set once @soc_permyriad holds a real estimate
+ * @fg_full:		The charger has finished a charge on the input that is
+ *			still attached, so the pack is full whatever the curve
+ *			says, see smb_fg_track_completion()
+ * @fg_charge_seen:	A charge has actually been in progress since that input
+ *			appeared, which is what makes a later inhibit mean
+ *			completion rather than a top-up that was never needed
  */
 struct smb_chip {
 	struct device *dev;
@@ -591,6 +603,8 @@ struct smb_chip {
 	s64 fg_residue;
 	ktime_t fg_last;
 	bool fg_ready;
+	bool fg_full;
+	bool fg_charge_seen;
 };
 
 static enum power_supply_property smb_properties[] = {
@@ -698,6 +712,19 @@ static int smb_get_prop_status(struct smb_chip *chip, int *val)
 	}
 
 	*val = chip->var->charge_status[stat[0] & BATTERY_CHARGER_STATUS_MASK];
+
+	/*
+	 * Inhibit is where a finished charge comes to rest, and by itself it
+	 * cannot be told apart from a charge that never needed to start - so
+	 * the table has to call it not-charging. Where the gauge has watched
+	 * the charge that led into it, say so.
+	 */
+	if ((stat[0] & BATTERY_CHARGER_STATUS_MASK) == chip->var->inhibit_code) {
+		guard(mutex)(&chip->fg_lock);
+
+		if (chip->fg_full)
+			*val = POWER_SUPPLY_STATUS_FULL;
+	}
 
 	return 0;
 }
@@ -1151,6 +1178,63 @@ static int smb_ocv_to_permyriad(struct smb_chip *chip, int ocv_uv)
 }
 
 /**
+ * smb_fg_track_completion() - follow the charger through the end of a charge
+ * @chip: the charger
+ *
+ * Termination is the one point on the curve the charger knows better than any
+ * gauge: it stopped because the cell reached the float voltage at below the
+ * termination current, which is what full means. But it is also a state the
+ * charger passes through rather than sits in - having terminated, the cell is
+ * by definition above the recharge threshold, so the hardware moves on to
+ * inhibit and stays there. A gauge that only recognises the instant of
+ * termination therefore has to sample it inside that window, and then watches
+ * the OCV correction walk its answer back down over the next few polls.
+ *
+ * So remember it instead. Inhibit is not evidence of a full pack on its own -
+ * it is equally what a charger does when it is handed a cell that was already
+ * above the threshold when the cable went in - but inhibit *after* a charge was
+ * running is the tail of that charge. That pairing is what this tracks, and it
+ * needs no knowledge of where the inhibit threshold happens to be set.
+ *
+ * Returns: true while the attached input has finished charging the pack.
+ */
+static bool smb_fg_track_completion(struct smb_chip *chip)
+{
+	unsigned int status, code;
+	int online = 0;
+
+	guard(mutex)(&chip->fg_lock);
+
+	smb_get_prop_usb_online(chip, &online);
+	if (!online) {
+		chip->fg_full = false;
+		chip->fg_charge_seen = false;
+		return false;
+	}
+
+	if (regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_1,
+			&status))
+		return chip->fg_full;
+
+	code = status & BATTERY_CHARGER_STATUS_MASK;
+	if (code == CHARGE_STATUS_TERMINATE) {
+		chip->fg_full = true;
+	} else if (chip->var->charge_status[code] ==
+		   POWER_SUPPLY_STATUS_CHARGING) {
+		chip->fg_charge_seen = true;
+		chip->fg_full = false;
+	} else if (code == chip->var->inhibit_code && chip->fg_charge_seen) {
+		chip->fg_full = true;
+	}
+
+	/*
+	 * The remaining codes - pause, disable - say nothing either way about
+	 * how much charge is in the pack, so they leave the answer alone.
+	 */
+	return chip->fg_full;
+}
+
+/**
  * smb_fg_work() - integrate the fuel gauge over one poll interval
  * @work: the delayed work in struct smb_chip
  *
@@ -1164,7 +1248,6 @@ static int smb_ocv_to_permyriad(struct smb_chip *chip, int ocv_uv)
  */
 static bool smb_fg_update(struct smb_chip *chip)
 {
-	unsigned int status;
 	int v_uv, i_ua, ocv_uv, soc_ocv, was, weight;
 	ktime_t now = ktime_get_boottime();
 	s64 elapsed_ms;
@@ -1173,19 +1256,16 @@ static bool smb_fg_update(struct smb_chip *chip)
 		return false;
 
 	/*
-	 * Termination is the one point on the curve the charger knows better
-	 * than any gauge: it stopped because the cell reached the float
-	 * voltage at below the termination current, which is what full means.
-	 * Take it, rather than leaving the integral a few percent short of a
-	 * battery that will not accept any more.
-	 *
-	 * This asks the register for that one code rather than asking for the
-	 * reported status, because more than one state reports as full and
-	 * only this one is evidence of a finished charge.
+	 * Hold the pack at full for as long as the charger says it finished
+	 * charging it. This is not a shortcut past the curve, it is the one
+	 * place the curve cannot answer: the table's top entry is an OCV of
+	 * over 4.37 V, which a cell charged to a 4.39 V float only shows while
+	 * it is still being held there. Left to relax it settles some seventy
+	 * millivolts lower, six percent down the table, and a full battery
+	 * reads as not quite full for the rest of the time it stays on the
+	 * cable.
 	 */
-	if (!regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_1,
-			 &status) &&
-	    (status & BATTERY_CHARGER_STATUS_MASK) == CHARGE_STATUS_TERMINATE) {
+	if (smb_fg_track_completion(chip)) {
 		guard(mutex)(&chip->fg_lock);
 
 		was = chip->fg_ready ? chip->soc_permyriad : -1;
@@ -1617,6 +1697,7 @@ static const struct smb_variant smb_variant_pmi8998 = {
 	.float_step_uv = 7500,
 	.ov_bit = CHARGER_ERROR_STATUS_BAT_OV_BIT,
 	.charge_status = smb2_charge_status,
+	.inhibit_code = 6,
 	.temp_status_reg = BATTERY_CHARGER_STATUS_2,
 	.temp_status_shift = 0,
 	.init_seq = smb2_init_seq,
@@ -1632,6 +1713,7 @@ static const struct smb_variant smb_variant_pm660 = {
 	.float_step_uv = 7500,
 	.ov_bit = CHARGER_ERROR_STATUS_BAT_OV_BIT,
 	.charge_status = smb2_charge_status,
+	.inhibit_code = 6,
 	.temp_status_reg = BATTERY_CHARGER_STATUS_2,
 	.temp_status_shift = 0,
 	.init_seq = smb2_init_seq,
@@ -1647,6 +1729,7 @@ static const struct smb_variant smb_variant_pmi632 = {
 	.float_step_uv = 10000,
 	.ov_bit = SMB5_CHARGER_ERROR_STATUS_BAT_OV_BIT,
 	.charge_status = smb5_charge_status,
+	.inhibit_code = 0,
 	/*
 	 * On SMB5 the JEITA temperature-status bits moved out of
 	 * BATTERY_CHARGER_STATUS_2 into BATTERY_CHARGER_STATUS_7, and the
