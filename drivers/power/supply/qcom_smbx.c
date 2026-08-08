@@ -429,15 +429,38 @@
 #define CURRENT_SCALE_FACTOR				25000
 /* clang-format on */
 
-enum charger_status {
-	TRICKLE_CHARGE = 0,
-	PRE_CHARGE,
-	FAST_CHARGE,
-	FULLON_CHARGE,
-	TAPER_CHARGE,
-	TERMINATE_CHARGE,
-	INHIBIT_CHARGE,
-	DISABLE_CHARGE,
+/*
+ * What the eight BATTERY_CHARGER_STATUS_1 codes mean, per generation. SMB5
+ * renumbered them: INHIBIT moved from 6 down to 0, the three codes below it
+ * shifted up by one, and PAUSE - which SMB2 does not have - took the 6 that
+ * INHIBIT left behind. Codes 3, 4, 5 and 7 mean the same thing on both, which
+ * is why reading an SMB5 PMIC through the SMB2 table looks right in the middle
+ * of a charge and is wrong at either end of it.
+ *
+ * Inhibit is reported as full because that is what inhibits: the cell is above
+ * the recharge threshold. Pause is not - it is a charge that stopped for a
+ * reason of its own.
+ */
+static const u8 smb2_charge_status[8] = {
+	POWER_SUPPLY_STATUS_CHARGING,		/* 0 trickle */
+	POWER_SUPPLY_STATUS_CHARGING,		/* 1 pre */
+	POWER_SUPPLY_STATUS_CHARGING,		/* 2 fast */
+	POWER_SUPPLY_STATUS_CHARGING,		/* 3 full-on */
+	POWER_SUPPLY_STATUS_CHARGING,		/* 4 taper */
+	POWER_SUPPLY_STATUS_FULL,		/* 5 terminate */
+	POWER_SUPPLY_STATUS_FULL,		/* 6 inhibit */
+	POWER_SUPPLY_STATUS_NOT_CHARGING,	/* 7 disable */
+};
+
+static const u8 smb5_charge_status[8] = {
+	POWER_SUPPLY_STATUS_FULL,		/* 0 inhibit */
+	POWER_SUPPLY_STATUS_CHARGING,		/* 1 trickle */
+	POWER_SUPPLY_STATUS_CHARGING,		/* 2 pre */
+	POWER_SUPPLY_STATUS_CHARGING,		/* 3 full-on */
+	POWER_SUPPLY_STATUS_CHARGING,		/* 4 taper */
+	POWER_SUPPLY_STATUS_FULL,		/* 5 terminate */
+	POWER_SUPPLY_STATUS_NOT_CHARGING,	/* 6 pause */
+	POWER_SUPPLY_STATUS_NOT_CHARGING,	/* 7 disable */
 };
 
 struct smb_init_register {
@@ -462,6 +485,8 @@ struct smb_init_register {
  * @float_step_uv:	uV per LSB of FLOAT_VOLTAGE_CFG
  * @ov_bit:		BAT_OV (overvoltage) bit within BATTERY_CHARGER_STATUS_2
  *			(BIT(5) on SMB2, BIT(1) on SMB5)
+ * @charge_status:	What each of the eight BATTERY_CHARGER_STATUS_1 codes
+ *			means on this generation, see smb2_charge_status
  * @temp_status_reg:	Register holding the JEITA temperature-status bits,
  *			relative to @base (BATTERY_CHARGER_STATUS_2 = 0x07 on
  *			SMB2, BATTERY_CHARGER_STATUS_7 = 0x0D on SMB5)
@@ -483,6 +508,7 @@ struct smb_variant {
 	u32 float_base_uv;
 	u32 float_step_uv;
 	u8 ov_bit;
+	const u8 *charge_status;
 	u16 temp_status_reg;
 	u8 temp_status_shift;
 	const struct smb_init_register *init_seq;
@@ -648,32 +674,19 @@ static int smb_get_prop_status(struct smb_chip *chip, int *val)
 		return rc;
 	}
 
-	if (stat[1] & CHARGER_ERROR_STATUS_BAT_OV_BIT) {
+	/*
+	 * Which bit of STATUS_2 carries BAT_OV also moved between the
+	 * generations, so it has to come from the variant here as it does
+	 * everywhere else this register is read.
+	 */
+	if (stat[1] & chip->var->ov_bit) {
 		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
 		return 0;
 	}
 
-	stat[0] = stat[0] & BATTERY_CHARGER_STATUS_MASK;
+	*val = chip->var->charge_status[stat[0] & BATTERY_CHARGER_STATUS_MASK];
 
-	switch (stat[0]) {
-	case TRICKLE_CHARGE:
-	case PRE_CHARGE:
-	case FAST_CHARGE:
-	case FULLON_CHARGE:
-	case TAPER_CHARGE:
-		*val = POWER_SUPPLY_STATUS_CHARGING;
-		return rc;
-	case DISABLE_CHARGE:
-		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
-		return rc;
-	case TERMINATE_CHARGE:
-	case INHIBIT_CHARGE:
-		*val = POWER_SUPPLY_STATUS_FULL;
-		return rc;
-	default:
-		*val = POWER_SUPPLY_STATUS_UNKNOWN;
-		return rc;
-	}
+	return 0;
 }
 
 static inline int smb_get_current_limit(struct smb_chip *chip,
@@ -1584,6 +1597,7 @@ static const struct smb_variant smb_variant_pmi8998 = {
 	.float_base_uv = 3480000,	/* (v - 3487500) / 7500 + 1 == (v - 3480000) / 7500 */
 	.float_step_uv = 7500,
 	.ov_bit = CHARGER_ERROR_STATUS_BAT_OV_BIT,
+	.charge_status = smb2_charge_status,
 	.temp_status_reg = BATTERY_CHARGER_STATUS_2,
 	.temp_status_shift = 0,
 	.init_seq = smb2_init_seq,
@@ -1598,6 +1612,7 @@ static const struct smb_variant smb_variant_pm660 = {
 	.float_base_uv = 3480000,
 	.float_step_uv = 7500,
 	.ov_bit = CHARGER_ERROR_STATUS_BAT_OV_BIT,
+	.charge_status = smb2_charge_status,
 	.temp_status_reg = BATTERY_CHARGER_STATUS_2,
 	.temp_status_shift = 0,
 	.init_seq = smb2_init_seq,
@@ -1612,6 +1627,7 @@ static const struct smb_variant smb_variant_pmi632 = {
 	.float_base_uv = 3600000,	/* qpnp-smb5 fv: min 3600000, step 10000 */
 	.float_step_uv = 10000,
 	.ov_bit = SMB5_CHARGER_ERROR_STATUS_BAT_OV_BIT,
+	.charge_status = smb5_charge_status,
 	/*
 	 * On SMB5 the JEITA temperature-status bits moved out of
 	 * BATTERY_CHARGER_STATUS_2 into BATTERY_CHARGER_STATUS_7, and the
