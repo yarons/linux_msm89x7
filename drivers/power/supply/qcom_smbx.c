@@ -424,16 +424,25 @@
 #define QG_I_LSB_NA					152588
 
 /*
- * How often the gauge integrates, and the currents at which an open-circuit
- * voltage reading is trusted enough to correct the integral. The wider band
- * still carries an IR error of a few millivolts, which is why it only nudges;
- * the narrow one is small enough to steer with.
+ * A scratch SRAM in the gauge that a warm reboot keeps. The downstream driver
+ * persists the state of charge here and restores it at boot rather than
+ * re-deriving it from a rest OCV that has gone stale between the rare captures
+ * this pack allows; mirror that. Offsets are the downstream qg-reg.h ones; the
+ * magic is our own, so only a value this driver wrote is ever restored.
+ */
+#define QG_SDAM_BASE					0xb100
+#define QG_SDAM_SOC					(QG_SDAM_BASE + 0x47)	/* 1 byte, percent */
+#define QG_SDAM_MAGIC					(QG_SDAM_BASE + 0x80)	/* 4 bytes */
+#define QG_SDAM_MAGIC_VALUE				0x736d6278		/* "smbx" */
+
+/*
+ * How often the gauge integrates, and the current below which a wake sample is
+ * rested enough for its voltage to be read as an open-circuit one. Above it the
+ * reading is loaded and steers nothing - correction then comes only from the
+ * hardware's own rested capture (see smb_fg_update()).
  */
 #define SMB_FG_POLL_MS					10000
 #define SMB_FG_OCV_QUIET_UA				50000
-#define SMB_FG_OCV_SETTLED_UA				150000
-#define SMB_FG_OCV_WEIGHT_QUIET				25
-#define SMB_FG_OCV_WEIGHT_SETTLED			3
 /*
  * A poll this late means the CPU was suspended rather than merely busy, so
  * the last current sample says nothing about the interval. Re-anchor on the
@@ -634,6 +643,8 @@ struct smb_chip {
 	bool fg_full;
 	bool fg_charge_seen;
 	bool fg_charging;
+	/* Last hardware rest-OCV harvested, to tell a fresh capture from a stale one */
+	int fg_good_ocv_uv;
 };
 
 static enum power_supply_property smb_properties[] = {
@@ -1267,20 +1278,78 @@ static bool smb_fg_track_completion(struct smb_chip *chip)
 }
 
 /**
- * smb_fg_work() - integrate the fuel gauge over one poll interval
- * @work: the delayed work in struct smb_chip
+ * smb_fg_take_good_ocv() - anchor to the gauge's own rested OCV when it is fresh
+ * @chip: the charger
+ * @changed: set to whether the reported percent moved, if a reading is taken
  *
- * Charge counting is what keeps the reported capacity still while the load
- * moves, but on its own it only ever accumulates error, so it is steered by
- * the OCV table whenever the current is low enough for the table to be worth
- * more than the integral. The two currents that gate that are deliberately
- * far below what this phone draws when it is awake and doing something: the
- * intent is to correct while it idles or charges gently, and to coast on the
- * integral the rest of the time.
+ * The gauge captures an open-circuit voltage on its own each time the current
+ * has stayed near zero long enough for a rest reading, and keeps it in
+ * S3_GOOD_OCV. Measured at rest, it carries none of the overpotential a loaded
+ * live sample does and none of the drift the integral accumulates - the same
+ * thing the boot seed is taken from, refreshed while running. A capture whose
+ * raw value has not changed is the rest already used, not a new one, so it is
+ * left alone; re-taking it after the pack has moved would walk the answer back.
+ *
+ * Runs from the poll and, where the device tree wires it, from the good-OCV
+ * interrupt, so it takes the lock and de-dups on the raw value. Returns whether
+ * a fresh reading was taken.
+ */
+static bool smb_fg_take_good_ocv(struct smb_chip *chip, bool *changed)
+{
+	int gv_uv, gi_ua, gsoc, was;
+
+	if (smb_qg_read_sample(chip, QG_S3_GOOD_OCV_V_DATA0, &gv_uv, &gi_ua) < 0)
+		return false;
+
+	guard(mutex)(&chip->fg_lock);
+
+	if (gv_uv == chip->fg_good_ocv_uv)
+		return false;
+	chip->fg_good_ocv_uv = gv_uv;
+
+	gsoc = smb_ocv_to_permyriad(chip, smb_batt_ocv(chip, gv_uv, gi_ua));
+	if (gsoc < 0)
+		return false;
+
+	was = chip->fg_ready ? chip->soc_permyriad : -1;
+	chip->soc_permyriad = gsoc;
+	chip->fg_residue = 0;
+	chip->fg_ready = true;
+	chip->fg_last = ktime_get_boottime();
+	dev_dbg(chip->dev, "fg: re-anchor good_ocv=%duV -> %d.%02d%%\n",
+		gv_uv, gsoc / 100, gsoc % 100);
+
+	if (changed)
+		*changed = was != chip->soc_permyriad;
+	return true;
+}
+
+static irqreturn_t smb_handle_good_ocv(int irq, void *data)
+{
+	struct smb_chip *chip = data;
+	bool changed = false;
+
+	if (smb_fg_take_good_ocv(chip, &changed) && changed)
+		power_supply_changed(chip->batt_psy);
+
+	return IRQ_HANDLED;
+}
+
+/**
+ * smb_fg_update() - carry the fuel gauge across one poll interval
+ * @chip: the charger
+ *
+ * The reported capacity is counted from charge, which keeps it still while the
+ * load moves. Counting only accumulates error, so it is corrected - but never
+ * from a loaded live sample, which the flat middle of the curve turns into a
+ * large one-directional error. Correction comes only from readings the hardware
+ * took at rest: the gauge's own S3_GOOD_OCV, the charger's completion, and the
+ * re-anchor a suspend allows.
  */
 static bool smb_fg_update(struct smb_chip *chip)
 {
-	int v_uv, i_ua, ocv_uv, soc_ocv, was, weight;
+	int v_uv, i_ua, ocv_uv, soc_ocv, was;
+	bool changed = false;
 	ktime_t now = ktime_get_boottime();
 	s64 elapsed_ms;
 
@@ -1309,52 +1378,55 @@ static bool smb_fg_update(struct smb_chip *chip)
 		return was != chip->soc_permyriad;
 	}
 
+	/* Prefer the gauge's own rested reading whenever it has a fresh one. */
+	if (smb_fg_take_good_ocv(chip, &changed))
+		return changed;
+
 	ocv_uv = smb_batt_ocv(chip, v_uv, i_ua);
 	soc_ocv = smb_ocv_to_permyriad(chip, ocv_uv);
 	if (soc_ocv < 0)
 		return false;
 
 	/*
-	 * A charger in its constant-voltage phase holds the terminal at the
-	 * float voltage and lets the current decay, so what the ADC reads
-	 * there is the charger's number and not the cell's. Subtracting I*R
-	 * does not recover an open-circuit voltage from it - the current is
-	 * small by then, a few millivolts' worth - and the table, asked about
-	 * a voltage above its top entry, answers a hundred percent while the
-	 * pack is still filling. Count charge and nothing else while the
-	 * charger is driving; the completion the charger reports is what ends
-	 * that, and it is the honest hundred percent.
+	 * Between the fixed points the state of charge is counted, not read off
+	 * the live voltage. A voltage taken under load is not an open-circuit
+	 * voltage: the constant series resistance recovers the ohmic step but not
+	 * the slower overpotential, and on the flat middle of the discharge curve
+	 * - eighteen points inside forty millivolts here - the tens of millivolts
+	 * left over become a large, one-directional error in the answer. So the
+	 * live sample steers nothing. Correction comes only from readings the
+	 * hardware took at rest: the S3_GOOD_OCV re-anchor above, the charger's
+	 * own completion, and the re-anchor a suspend allows below.
 	 */
-	if (chip->fg_charging)
-		weight = 0;
-	else if (abs(i_ua) <= SMB_FG_OCV_QUIET_UA)
-		weight = SMB_FG_OCV_WEIGHT_QUIET;
-	else if (abs(i_ua) <= SMB_FG_OCV_SETTLED_UA)
-		weight = SMB_FG_OCV_WEIGHT_SETTLED;
-	else
-		weight = 0;
-
 	guard(mutex)(&chip->fg_lock);
 
 	elapsed_ms = ktime_ms_delta(now, chip->fg_last);
 	was = chip->fg_ready ? chip->soc_permyriad : -1;
 
-	if (!chip->fg_ready ||
-	    (elapsed_ms > SMB_FG_STALE_MS && !chip->fg_charging)) {
+	if (!chip->fg_ready) {
 		/*
-		 * A gap this long means the system was suspended, so the
-		 * sample says nothing about what happened during it. A
-		 * suspended phone is also a rested battery, which is the one
-		 * condition where the OCV table needs no help at all - take it
-		 * outright rather than integrating a current nobody drew.
-		 *
-		 * Unless it suspended on a charger, which is the exception: a
-		 * cell being held at the float voltage is the least rested it
-		 * ever gets, whatever the CPU was doing.
+		 * Nothing has seeded the gauge yet - the boot OCV registers were
+		 * unreadable. Bootstrap from the live sample whatever its current,
+		 * since there is no better number to start from; the first rest
+		 * correction puts it right.
 		 */
 		chip->soc_permyriad = soc_ocv;
 		chip->fg_residue = 0;
 		chip->fg_ready = true;
+	} else if (elapsed_ms > SMB_FG_STALE_MS && !chip->fg_charging) {
+		/*
+		 * A gap this long is a suspend: nothing was counted across it, and
+		 * the live sample describes only the instant of waking. A phone
+		 * busy the moment it resumes gives a loaded reading, which on the
+		 * flat curve is a large, one-directional error - so do not anchor
+		 * to it. A suspend draws too little to have moved the charge, so
+		 * keep the count as it was and let the hardware rest-OCV re-anchor
+		 * correct any residual. Only a wake sample that is itself at rest
+		 * is a real open-circuit voltage worth taking outright.
+		 */
+		if (abs(i_ua) <= SMB_FG_OCV_QUIET_UA)
+			chip->soc_permyriad = soc_ocv;
+		chip->fg_residue = 0;
 	} else {
 		/*
 		 * charge (uAh) = i_ua * elapsed / 3600, and one percent of the
@@ -1374,18 +1446,54 @@ static bool smb_fg_update(struct smb_chip *chip)
 		chip->fg_residue -= step * per_permyriad;
 
 		chip->soc_permyriad += step;
-		chip->soc_permyriad += (soc_ocv - chip->soc_permyriad) * weight / 100;
 		chip->soc_permyriad = clamp(chip->soc_permyriad, 0, 100 * 100);
 	}
 
 	chip->fg_last = now;
 
-	dev_dbg(chip->dev, "fg: %d.%02d%% vbat=%duV ibat=%duA ocv=%duV w=%d\n",
+	dev_dbg(chip->dev,
+		"fg: %d.%02d%% vbat=%duV ibat=%duA ocv=%duV(soc %d)\n",
 		chip->soc_permyriad / 100, chip->soc_permyriad % 100, v_uv,
-		i_ua, ocv_uv, weight);
+		i_ua, ocv_uv, soc_ocv);
 
 	return DIV_ROUND_CLOSEST(chip->soc_permyriad, 100) !=
 	       DIV_ROUND_CLOSEST(was, 100);
+}
+
+/*
+ * Persist the state of charge to the gauge's scratch SRAM so a warm reboot can
+ * restore it. One byte of percent is enough; the magic that guards it is
+ * written once, when the gauge starts.
+ */
+static void smb_fg_sdam_store(struct smb_chip *chip)
+{
+	unsigned int soc;
+
+	scoped_guard(mutex, &chip->fg_lock)
+		soc = clamp(DIV_ROUND_CLOSEST(chip->soc_permyriad, 100), 0, 100);
+
+	regmap_write(chip->regmap, QG_SDAM_SOC, soc);
+}
+
+/*
+ * Restore the state of charge the last boot persisted, if this driver is what
+ * wrote it. A warm reboot keeps the SRAM; a battery swap clears it and the magic
+ * no longer matches, so the caller falls back to seeding from an OCV instead.
+ */
+static bool smb_fg_sdam_restore(struct smb_chip *chip, int *soc_permyriad)
+{
+	__le32 magic;
+	unsigned int soc;
+
+	if (regmap_bulk_read(chip->regmap, QG_SDAM_MAGIC, &magic, sizeof(magic)))
+		return false;
+	if (le32_to_cpu(magic) != QG_SDAM_MAGIC_VALUE)
+		return false;
+	if (regmap_read(chip->regmap, QG_SDAM_SOC, &soc) || soc > 100)
+		return false;
+
+	*soc_permyriad = soc * 100;
+	return true;
 }
 
 static void smb_fg_work(struct work_struct *work)
@@ -1395,6 +1503,8 @@ static void smb_fg_work(struct work_struct *work)
 
 	if (smb_fg_update(chip))
 		power_supply_changed(chip->batt_psy);
+
+	smb_fg_sdam_store(chip);
 
 	schedule_delayed_work(&chip->fg_work, msecs_to_jiffies(SMB_FG_POLL_MS));
 }
@@ -1425,21 +1535,53 @@ static int smb_fg_start(struct smb_chip *chip)
 	if (rc)
 		return rc;
 
-	for (i = 0; i < ARRAY_SIZE(rest_ocv); i++) {
-		if (smb_qg_read_sample(chip, rest_ocv[i], &v_uv, &i_ua) < 0)
-			continue;
-
-		soc = smb_ocv_to_permyriad(chip, smb_batt_ocv(chip, v_uv, i_ua));
-		if (soc < 0)
-			continue;
-
+	/*
+	 * Restore the state of charge the last boot persisted to the scratch
+	 * SRAM. A warm reboot keeps it, and unlike a rest OCV it does not go
+	 * stale between the rare captures this pack allows - so prefer it, and
+	 * seed from an OCV only when the SRAM holds nothing this driver wrote.
+	 */
+	if (smb_fg_sdam_restore(chip, &soc)) {
 		chip->soc_permyriad = soc;
 		chip->fg_ready = true;
-		/* so the first poll integrates rather than re-anchoring */
 		chip->fg_last = ktime_get_boottime();
-		dev_dbg(chip->dev, "fg: seeded at %d.%02d%% from %duV\n",
-			soc / 100, soc % 100, v_uv);
-		break;
+		dev_dbg(chip->dev, "fg: restored %d.%02d%% from sdam\n",
+			soc / 100, soc % 100);
+	} else {
+		for (i = 0; i < ARRAY_SIZE(rest_ocv); i++) {
+			if (smb_qg_read_sample(chip, rest_ocv[i], &v_uv, &i_ua) < 0)
+				continue;
+
+			soc = smb_ocv_to_permyriad(chip, smb_batt_ocv(chip, v_uv, i_ua));
+			if (soc < 0)
+				continue;
+
+			chip->soc_permyriad = soc;
+			chip->fg_ready = true;
+			/* so the first poll integrates rather than re-anchoring */
+			chip->fg_last = ktime_get_boottime();
+			/*
+			 * If this seed is the hardware rest-OCV the poll also
+			 * watches, record it so the first poll does not re-take
+			 * the same capture.
+			 */
+			if (rest_ocv[i] == QG_S3_GOOD_OCV_V_DATA0)
+				chip->fg_good_ocv_uv = v_uv;
+			dev_dbg(chip->dev, "fg: seeded at %d.%02d%% from %duV\n",
+				soc / 100, soc % 100, v_uv);
+			break;
+		}
+	}
+
+	/*
+	 * Claim the SRAM store so the next boot restores our own value rather
+	 * than whatever wrote it last.
+	 */
+	if (chip->fg_ready) {
+		__le32 magic = cpu_to_le32(QG_SDAM_MAGIC_VALUE);
+
+		regmap_bulk_write(chip->regmap, QG_SDAM_MAGIC, &magic,
+				  sizeof(magic));
 	}
 
 	rc = devm_delayed_work_autocancel(chip->dev, &chip->fg_work,
@@ -2423,6 +2565,29 @@ static int smb_probe(struct platform_device *pdev)
 	rc = smb_init_irq(chip, &irq, "wdog-bark", smb_handle_wdog_bark);
 	if (rc < 0)
 		return rc;
+
+	/*
+	 * The gauge raises this the moment it captures a fresh rested
+	 * open-circuit voltage, which is exactly when the state of charge should
+	 * re-anchor on it - sooner and more reliably than the poll, which can
+	 * only catch a reading that is still valid when it happens to run. It is
+	 * optional: a device tree without it falls back to that poll, and there
+	 * is nothing to wire when the fuel gauge itself is not registered.
+	 */
+	if (chip->batt_psy) {
+		irq = platform_get_irq_byname_optional(to_platform_device(chip->dev),
+						       "good-ocv");
+		if (irq == -EPROBE_DEFER)
+			return irq;
+		if (irq > 0) {
+			rc = devm_request_threaded_irq(chip->dev, irq, NULL,
+						       smb_handle_good_ocv,
+						       IRQF_ONESHOT, "good-ocv", chip);
+			if (rc < 0)
+				return dev_err_probe(chip->dev, rc,
+						     "Couldn't request good-ocv irq\n");
+		}
+	}
 
 	devm_device_init_wakeup(chip->dev);
 
