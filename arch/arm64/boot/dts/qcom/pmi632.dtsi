@@ -5,6 +5,7 @@
 
 #include <dt-bindings/iio/qcom,spmi-vadc.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/leds/common.h>
 #include <dt-bindings/spmi/spmi.h>
 
 / {
@@ -57,11 +58,13 @@
 			interrupts = <0x2 0x13 0x4 IRQ_TYPE_EDGE_BOTH>,
 				     <0x2 0x12 0x2 IRQ_TYPE_EDGE_BOTH>,
 				     <0x2 0x16 0x1 IRQ_TYPE_EDGE_RISING>,
-				     <0x2 0x13 0x6 IRQ_TYPE_EDGE_RISING>;
+				     <0x2 0x13 0x6 IRQ_TYPE_EDGE_RISING>,
+				     <0x2 0x48 0x4 IRQ_TYPE_EDGE_RISING>;
 			interrupt-names = "usb-plugin",
 					  "bat-ov",
 					  "wdog-bark",
-					  "usbin-icl-change";
+					  "usbin-icl-change",
+					  "good-ocv";
 
 			io-channels = <&pmi632_adc ADC5_USB_IN_I>,
 				      <&pmi632_adc ADC5_USB_IN_V_16>,
@@ -237,6 +240,12 @@
 		pmi632_vib: vibrator@5700 {
 			compatible = "qcom,pmi632-vib";
 			reg = <0x5700>;
+			status = "disabled";
+		};
+
+		pmi632_flash: led-controller@d300 {
+			compatible = "qcom,pmi632-flash-led", "qcom,spmi-flash-led";
+			reg = <0xd300>;
 			status = "disabled";
 		};
 	};
