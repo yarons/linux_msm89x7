@@ -101,8 +101,25 @@
 #define NO_OF_SAMPLE_FOR_RCHG				GENMASK(3, 2)
 #define NO_OF_SAMPLE_FOR_RCHG_SHIFT			2
 
+/*
+ * SMB5 only: the current the charger calls a charge finished at, compared by
+ * the same ADC the gauge reports from and in the same 152588 nA units - so the
+ * threshold is written in the gauge's sign convention, negative into the
+ * battery (smb5-reg.h CHGR_ADC_ITERM_UP_THD_MSB/LSB_REG).
+ */
+#define ADC_ITERM_UP_THD_MSB				0x67
+#define ADC_ITERM_UP_THD_LSB				0x68
+
 #define FLOAT_VOLTAGE_CFG				0x70
 #define FLOAT_VOLTAGE_SETTING_MASK			GENMASK(7, 0)
+
+/*
+ * Which of the two termination comparators the charger acts on. Clear selects
+ * the ADC threshold above; set selects an analog comparator this driver does
+ * not program (smb5-reg.h CHGR_ENG_CHARGING_CFG_REG).
+ */
+#define ENG_CHARGING_CFG				0xC0
+#define ITERM_USE_ANALOG_BIT				BIT(3)
 
 #define ADC_RECHARGE_THRESHOLD_MSB			0x7E
 #define ADC_RECHARGE_THRESHOLD_LSB			0x7F
@@ -400,6 +417,33 @@
 #define STAT_IRQ_PULSING_EN_BIT				BIT(0)
 
 /*
+ * SMB5 only: the connector thermistor, and what the charger does about it.
+ * The PMIC biases the thermistor from an internal pull-up, measures it on one
+ * of the BATIF ADC channels, and - once that channel is named as a
+ * thermal-regulation source - pulls the input current back on its own when the
+ * connector gets hot. All three have to be set for any of it to happen
+ * (smb5-reg.h BATIF_ADC_INTERNAL_PULL_UP_REG, BATIF_ADC_CHANNEL_EN_REG and
+ * MISC_THERMREG_SRC_CFG_REG).
+ *
+ * The pull-up register holds two bits per thermistor, in the order the
+ * downstream driver enumerates them - battery, misc, connector, smb - so the
+ * connector's are bits 5:4.
+ */
+#define BATIF_ADC_INTERNAL_PULL_UP			0x286
+#define CONN_THM_PULL_UP_MASK				GENMASK(5, 4)
+#define CONN_THM_PULL_UP_SHIFT				4
+#define PULL_UP_NONE					0
+#define PULL_UP_30K					1
+#define PULL_UP_100K					2
+#define PULL_UP_400K					3
+
+#define BATIF_ADC_CHANNEL_EN				0x282
+#define CONN_THM_CHANNEL_EN_BIT				BIT(4)
+
+#define MISC_THERMREG_SRC_CFG				0x670
+#define THERMREG_CONNECTOR_ADC_SRC_EN_BIT		BIT(4)
+
+/*
  * Fuel-gauge (QG) peripheral, present on SMB5 PMICs. Its base is absolute
  * inside the PMIC rather than relative to the charger's own base, and is
  * carried in smb_variant::qg_base. The offsets and the LSB sizes below are
@@ -450,6 +494,19 @@
  */
 #define SMB_FG_STALE_MS					60000
 
+/*
+ * How far the persisted state of charge may sit from the gauge's own rested
+ * capture before the measurement is preferred to it at boot, in hundredths of
+ * a percent. The two disagree by a few points in ordinary use: the OCV table
+ * is characterised at one temperature and read at whatever the pack happens to
+ * be, and the count it is compared against has been integrating since the last
+ * rest. Ten points is past what either explains, and what is left is a stored
+ * value that no longer describes the pack - a battery changed while the phone
+ * was off, or a count that drifted through a session which never terminated a
+ * charge.
+ */
+#define SMB_FG_SEED_DISAGREE				(10 * 100)
+
 #define SDP_CURRENT_UA					500000
 #define CDP_CURRENT_UA					1500000
 #define DCP_CURRENT_UA					1500000
@@ -476,6 +533,41 @@
  * the only one that says the charger stopped because the battery is full.
  */
 #define CHARGE_STATUS_TERMINATE				5
+
+/*
+ * Which kind of charging each of the eight codes is, for CHARGE_TYPE. Status
+ * says whether the pack is being charged; this says how hard, and it is the
+ * difference between a charge that is progressing and one that has reached the
+ * float voltage and is tapering off. Taken from the downstream
+ * smblib_get_prop_batt_charge_type(), which draws the same distinctions.
+ *
+ * Mainline has no value meaning taper, and the drivers that meet a CV phase do
+ * not report one - rk817 puts constant-current and constant-voltage together
+ * under STANDARD. So the taper code is reported as STANDARD against FULLON's
+ * FAST: the names fit loosely, but the transition userspace cares about, the
+ * one where the current starts falling away, still shows up as a change.
+ */
+static const u8 smb2_charge_type[8] = {
+	POWER_SUPPLY_CHARGE_TYPE_TRICKLE,	/* 0 trickle */
+	POWER_SUPPLY_CHARGE_TYPE_TRICKLE,	/* 1 pre */
+	POWER_SUPPLY_CHARGE_TYPE_FAST,		/* 2 fast */
+	POWER_SUPPLY_CHARGE_TYPE_FAST,		/* 3 full-on */
+	POWER_SUPPLY_CHARGE_TYPE_STANDARD,	/* 4 taper */
+	POWER_SUPPLY_CHARGE_TYPE_NONE,		/* 5 terminate */
+	POWER_SUPPLY_CHARGE_TYPE_NONE,		/* 6 inhibit */
+	POWER_SUPPLY_CHARGE_TYPE_NONE,		/* 7 disable */
+};
+
+static const u8 smb5_charge_type[8] = {
+	POWER_SUPPLY_CHARGE_TYPE_NONE,		/* 0 inhibit */
+	POWER_SUPPLY_CHARGE_TYPE_TRICKLE,	/* 1 trickle */
+	POWER_SUPPLY_CHARGE_TYPE_TRICKLE,	/* 2 pre */
+	POWER_SUPPLY_CHARGE_TYPE_FAST,		/* 3 full-on */
+	POWER_SUPPLY_CHARGE_TYPE_STANDARD,	/* 4 taper */
+	POWER_SUPPLY_CHARGE_TYPE_NONE,		/* 5 terminate */
+	POWER_SUPPLY_CHARGE_TYPE_NONE,		/* 6 pause */
+	POWER_SUPPLY_CHARGE_TYPE_NONE,		/* 7 disable */
+};
 
 static const u8 smb2_charge_status[8] = {
 	POWER_SUPPLY_STATUS_CHARGING,		/* 0 trickle */
@@ -532,9 +624,17 @@ struct smb_init_register {
  *			(BIT(5) on SMB2, BIT(1) on SMB5)
  * @charge_status:	What each of the eight BATTERY_CHARGER_STATUS_1 codes
  *			means on this generation, see smb2_charge_status
+ * @charge_type:	What kind of charging each of the eight codes is,
+ *			see smb2_charge_type
  * @rechg_thresh_reg:	Register holding the battery-voltage recharge threshold,
  *			relative to @base, or 0 where this generation does not
  *			express one this way (SMB2)
+ * @iterm_thresh_reg:	Register pair holding the ADC termination-current
+ *			threshold, relative to @base, or 0 where this generation
+ *			does not express one this way (SMB2)
+ * @thermreg_src_reg:	Register naming which measurements the charger regulates
+ *			its input current against, relative to @base, or 0 where
+ *			this generation has no connector thermistor to add (SMB2)
  * @inhibit_code:	Which of those codes is charge inhibit - the state a
  *			finished charge settles into once the cell is above the
  *			recharge threshold (6 on SMB2, 0 on SMB5)
@@ -560,7 +660,10 @@ struct smb_variant {
 	u32 float_step_uv;
 	u8 ov_bit;
 	const u8 *charge_status;
+	const u8 *charge_type;
 	u16 rechg_thresh_reg;
+	u16 iterm_thresh_reg;
+	u16 thermreg_src_reg;
 	u8 inhibit_code;
 	u16 temp_status_reg;
 	u8 temp_status_shift;
@@ -765,6 +868,37 @@ static int smb_get_prop_status(struct smb_chip *chip, int *val)
 		if (chip->fg_full)
 			*val = POWER_SUPPLY_STATUS_FULL;
 	}
+
+	return 0;
+}
+
+/*
+ * How hard the pack is being charged, which is the distinction the status
+ * above cannot draw: a charge climbing at the full current and one that has
+ * reached the float voltage and is tapering off are both "charging", and only
+ * the second is nearly over. Without this the difference lives solely in the
+ * charger's own registers, which is a poor place to have to go looking - it
+ * needs root, a debugfs regmap, and knowing which of eight codes this
+ * generation numbers taper as.
+ */
+static int smb_get_prop_charge_type(struct smb_chip *chip, int *val)
+{
+	unsigned int stat;
+	int usb_online = 0;
+	int rc;
+
+	rc = smb_get_prop_usb_online(chip, &usb_online);
+	if (!usb_online) {
+		*val = POWER_SUPPLY_CHARGE_TYPE_NONE;
+		return rc;
+	}
+
+	rc = regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_1,
+			 &stat);
+	if (rc < 0)
+		return rc;
+
+	*val = chip->var->charge_type[stat & BATTERY_CHARGER_STATUS_MASK];
 
 	return 0;
 }
@@ -1092,6 +1226,7 @@ static irqreturn_t smb_handle_wdog_bark(int irq, void *data)
  */
 static enum power_supply_property smb_batt_properties[] = {
 	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_CHARGE_TYPE,
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_TECHNOLOGY,
@@ -1529,19 +1664,43 @@ static int smb_fg_start(struct smb_chip *chip)
 		QG_S3_GOOD_OCV_V_DATA0,
 		QG_S7_PON_OCV_V_DATA0,
 	};
-	int v_uv, i_ua, soc, rc, i;
+	int v_uv, i_ua, soc, rest_soc = -1, rest_uv = 0, rc, i;
 
 	rc = devm_mutex_init(chip->dev, &chip->fg_lock);
 	if (rc)
 		return rc;
+
+	/* The gauge's freshest rested capture, where it holds one. */
+	if (smb_qg_read_sample(chip, QG_S3_GOOD_OCV_V_DATA0, &v_uv, &i_ua) == 0) {
+		rest_soc = smb_ocv_to_permyriad(chip, smb_batt_ocv(chip, v_uv, i_ua));
+		rest_uv = v_uv;
+	}
 
 	/*
 	 * Restore the state of charge the last boot persisted to the scratch
 	 * SRAM. A warm reboot keeps it, and unlike a rest OCV it does not go
 	 * stale between the rare captures this pack allows - so prefer it, and
 	 * seed from an OCV only when the SRAM holds nothing this driver wrote.
+	 *
+	 * Prefer it, but do not believe it against the evidence. What is stored
+	 * is what a count had reached, and a count is only ever as good as the
+	 * corrections it received; what the gauge captured at rest is a
+	 * measurement of the pack itself. Where the two are far enough apart
+	 * that neither the table's temperature nor a session's drift explains
+	 * it, the measurement is the one describing the battery that is fitted
+	 * now - so take it, and say so, because a seed being overruled is worth
+	 * knowing about.
 	 */
 	if (smb_fg_sdam_restore(chip, &soc)) {
+		if (rest_soc >= 0 && abs(rest_soc - soc) > SMB_FG_SEED_DISAGREE) {
+			dev_info(chip->dev,
+				 "fg: stored %d.%02d%% disagrees with the rested %d.%02d%%, taking the measurement\n",
+				 soc / 100, soc % 100,
+				 rest_soc / 100, rest_soc % 100);
+			soc = rest_soc;
+			chip->fg_good_ocv_uv = rest_uv;
+		}
+
 		chip->soc_permyriad = soc;
 		chip->fg_ready = true;
 		chip->fg_last = ktime_get_boottime();
@@ -1671,6 +1830,8 @@ static int smb_batt_get_property(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 		return smb_get_prop_status(chip, &val->intval);
+	case POWER_SUPPLY_PROP_CHARGE_TYPE:
+		return smb_get_prop_charge_type(chip, &val->intval);
 	case POWER_SUPPLY_PROP_HEALTH:
 		return smb_get_prop_health(chip, &val->intval);
 	case POWER_SUPPLY_PROP_PRESENT:
@@ -1859,10 +2020,12 @@ static const struct smb_init_register pmi632_init_seq[] = {
 	/*
 	 * Take three samples before acting on the voltage comparator, which is
 	 * what the vendor driver asks for whenever it selects VBAT recharge.
+	 * The field counts from zero - downstream writes 2 here and calls it
+	 * three samples - so this is 2, not 3.
 	 */
 	{ .addr = NO_SAMPLE_TERM_RCHG_CFG,
 	  .mask = NO_OF_SAMPLE_FOR_RCHG,
-	  .val = 3 << NO_OF_SAMPLE_FOR_RCHG_SHIFT },
+	  .val = 2 << NO_OF_SAMPLE_FOR_RCHG_SHIFT },
 	/* Default SDP charger to a 500mA USB 2.0 port */
 	{ .addr = USBIN_ICL_OPTIONS,
 	  .mask = USB51_MODE_BIT | USBIN_MODE_CHG_BIT,
@@ -1909,6 +2072,7 @@ static const struct smb_variant smb_variant_pmi8998 = {
 	.float_step_uv = 7500,
 	.ov_bit = CHARGER_ERROR_STATUS_BAT_OV_BIT,
 	.charge_status = smb2_charge_status,
+	.charge_type = smb2_charge_type,
 	.inhibit_code = 6,
 	.temp_status_reg = BATTERY_CHARGER_STATUS_2,
 	.temp_status_shift = 0,
@@ -1925,6 +2089,7 @@ static const struct smb_variant smb_variant_pm660 = {
 	.float_step_uv = 7500,
 	.ov_bit = CHARGER_ERROR_STATUS_BAT_OV_BIT,
 	.charge_status = smb2_charge_status,
+	.charge_type = smb2_charge_type,
 	.inhibit_code = 6,
 	.temp_status_reg = BATTERY_CHARGER_STATUS_2,
 	.temp_status_shift = 0,
@@ -1941,7 +2106,10 @@ static const struct smb_variant smb_variant_pmi632 = {
 	.float_step_uv = 10000,
 	.ov_bit = SMB5_CHARGER_ERROR_STATUS_BAT_OV_BIT,
 	.charge_status = smb5_charge_status,
+	.charge_type = smb5_charge_type,
 	.rechg_thresh_reg = ADC_RECHARGE_THRESHOLD_MSB,
+	.iterm_thresh_reg = ADC_ITERM_UP_THD_MSB,
+	.thermreg_src_reg = MISC_THERMREG_SRC_CFG,
 	.inhibit_code = 0,
 	/*
 	 * On SMB5 the JEITA temperature-status bits moved out of
@@ -2061,6 +2229,152 @@ static int smb_set_recharge_threshold(struct smb_chip *chip)
 	if (rc < 0)
 		return dev_err_probe(chip->dev, rc,
 				     "Couldn't set the recharge threshold\n");
+
+	return 0;
+}
+
+/**
+ * smb_set_term_current() - tell the charger when a charge is finished
+ * @chip: the charger
+ *
+ * The charger stops at the float voltage once the current it is still pushing
+ * falls below this, and reports that it did so - a state nothing else on the
+ * PMIC produces, and the only moment either the hardware or this driver can
+ * call the pack full.
+ *
+ * The boot leaves a value here, so this is not a comparator that was missing:
+ * read back on a Fairphone 3 the threshold held -101.8 mA and the ADC source
+ * was already selected. What is wrong is whose number it is. A termination
+ * current is a property of the cell; the device tree is where this driver is
+ * told about the cell; and a threshold inherited from a bootloader is one that
+ * nothing in this kernel chose, states, or would notice changing under it.
+ *
+ * The threshold is compared by the gauge's own ADC, so it is written in the
+ * gauge's units and its sign convention - negative into the battery - while the
+ * battery node states a magnitude. A cell whose node does not name one is left
+ * alone rather than given an invented value, for the reason spelled out in
+ * smb_set_recharge_threshold().
+ *
+ * Returns: 0, or negative on error.
+ */
+static int smb_set_term_current(struct smb_chip *chip)
+{
+	int term_ua = chip->batt_info->charge_term_current_ua;
+	int raw, rc;
+
+	if (!chip->var->iterm_thresh_reg || term_ua <= 0)
+		return 0;
+
+	/*
+	 * The register is a signed 16-bit count of ADC LSBs, so the largest
+	 * current it can express is what fills it - the same +-5 A the
+	 * downstream driver bounds this property by.
+	 */
+	raw = -div_s64((s64)term_ua * 1000, QG_I_LSB_NA);
+	if (raw < S16_MIN) {
+		dev_warn(chip->dev,
+			 "termination current %u uA is beyond what the comparator can express, ignoring\n",
+			 term_ua);
+		return 0;
+	}
+
+	/* Act on the ADC comparator this programs, not the analog one */
+	rc = regmap_update_bits(chip->regmap, chip->base + ENG_CHARGING_CFG,
+				ITERM_USE_ANALOG_BIT, 0);
+	if (!rc)
+		rc = regmap_write(chip->regmap,
+				  chip->base + chip->var->iterm_thresh_reg,
+				  (raw >> 8) & 0xff);
+	if (!rc)
+		rc = regmap_write(chip->regmap,
+				  chip->base + chip->var->iterm_thresh_reg + 1,
+				  raw & 0xff);
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't set the termination current\n");
+
+	return 0;
+}
+
+/**
+ * smb_init_connector_therm() - let the charger protect its own connector
+ * @chip: the charger
+ *
+ * A USB connector heats up under a fast charge, and it is the one part of the
+ * path no thermal zone on the SoC can see: it is off-die, at the far end of
+ * the board, and what warms it is the current going through it. This PMIC can
+ * measure it directly, where the board wires a thermistor to the pin for it,
+ * and will then pull the input current back by itself when it gets hot - no
+ * software in the loop, and none of the latency that implies.
+ *
+ * Three writes turn that on and none of them does anything alone: bias the
+ * thermistor, enable the ADC channel that reads it, and name that channel as
+ * something the charger regulates against. What the board has to say is which
+ * pull-up its thermistor was chosen for; a board that says nothing gets none
+ * of this, because biasing a pin with no thermistor on it measures the pull-up
+ * and a charger regulating against that would throttle a connector that is
+ * perfectly cool.
+ *
+ * The die-temperature half of the same register is deliberately left alone: it
+ * describes the PMIC rather than the board, and changing it here would change
+ * what every other board using this driver does.
+ *
+ * Returns: 0, or negative on error.
+ */
+static int smb_init_connector_therm(struct smb_chip *chip)
+{
+	u32 pull_kohm, pull;
+	int rc;
+
+	if (!chip->var->thermreg_src_reg)
+		return 0;
+
+	if (device_property_read_u32(chip->dev,
+				     "qcom,connector-internal-pull-kohm",
+				     &pull_kohm))
+		return 0;
+
+	switch (pull_kohm) {
+	case 0:
+		pull = PULL_UP_NONE;
+		break;
+	case 30:
+		pull = PULL_UP_30K;
+		break;
+	case 100:
+		pull = PULL_UP_100K;
+		break;
+	case 400:
+		pull = PULL_UP_400K;
+		break;
+	default:
+		dev_warn(chip->dev,
+			 "connector pull-up %u kohm is not one the PMIC can switch in, ignoring\n",
+			 pull_kohm);
+		return 0;
+	}
+
+	rc = regmap_update_bits(chip->regmap,
+				chip->base + BATIF_ADC_INTERNAL_PULL_UP,
+				CONN_THM_PULL_UP_MASK,
+				pull << CONN_THM_PULL_UP_SHIFT);
+	if (!rc)
+		rc = regmap_update_bits(chip->regmap,
+					chip->base + BATIF_ADC_CHANNEL_EN,
+					CONN_THM_CHANNEL_EN_BIT,
+					CONN_THM_CHANNEL_EN_BIT);
+	if (!rc)
+		rc = regmap_update_bits(chip->regmap,
+					chip->base + chip->var->thermreg_src_reg,
+					THERMREG_CONNECTOR_ADC_SRC_EN_BIT,
+					THERMREG_CONNECTOR_ADC_SRC_EN_BIT);
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't enable connector thermal regulation\n");
+
+	dev_dbg(chip->dev,
+		"connector thermistor on a %u kohm pull-up, input current regulated against it\n",
+		pull_kohm);
 
 	return 0;
 }
@@ -2540,12 +2854,20 @@ static int smb_probe(struct platform_device *pdev)
 						     "Couldn't set the fast-charge current\n");
 		}
 
+		rc = smb_set_term_current(chip);
+		if (rc < 0)
+			return rc;
+
 		rc = smb_init_jeita(chip);
 		if (rc < 0)
 			return rc;
 	}
 
 	rc = smb_init_cooling(chip);
+	if (rc < 0)
+		return rc;
+
+	rc = smb_init_connector_therm(chip);
 	if (rc < 0)
 		return rc;
 
