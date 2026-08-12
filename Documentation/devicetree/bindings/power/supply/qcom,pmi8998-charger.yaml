@@ -56,7 +56,7 @@ properties:
   monitored-battery: true
 
   qcom,batt-id-pullup-ohms:
-    $ref: /schemas/types.yaml#/definitions/uint32
+    maxItems: 1
     description: |
       Resistance of the pull-up from the PMIC reference to the BAT_ID net, in
       ohms. Together with the voltage read on the bat_id channel this gives the
@@ -65,13 +65,13 @@ properties:
       it only on boards that route BAT_ID.
 
   qcom,batt-id-tolerance-percent:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    maximum: 100
+    maxItems: 1
     description: |
-      How far the resistance measured through that divider may differ from the
-      monitored battery's id-resistor-ohms and still count as the same pack.
-      The tolerance belongs here rather than to the cell because it has to
-      cover the divider and the ADC as well as the resistor itself.
+      How far, as a percentage, the resistance measured through that divider
+      may differ from the monitored battery's id-resistor-ohms and still count
+      as the same pack. The tolerance belongs here rather than to the cell
+      because it has to cover the divider and the ADC as well as the resistor
+      itself.
 
   qcom,auto-recharge-microvolt:
     description: |
@@ -103,7 +103,6 @@ properties:
       charge current is reduced instead of stopped.
 
   qcom,jeita-soft-fcc-microamp:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 2
     maxItems: 2
     description: |
