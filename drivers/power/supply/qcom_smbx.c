@@ -72,6 +72,17 @@
 #define CHG_EN_POLARITY_BIT				BIT(6)
 #define PRETOFAST_TRANSITION_CFG_BIT			BIT(5)
 #define BAT_OV_ECC_BIT					BIT(4)
+/*
+ * ☠️ On SMB5 this does not mean what the SMB2 comment below says. Clearing it
+ * there is described as enabling current termination; on a pmi632 it is what
+ * stops the charger ever leaving taper. Measured on a Fairphone 3 against the
+ * vendor stack running on the same phone, same pack, same supply: downstream
+ * leaves the bit SET and terminated within a minute of the current crossing the
+ * threshold, while this driver cleared it and sat below the same threshold for
+ * one hour forty-nine without terminating once. Every other input to the
+ * decision was identical between the two - threshold 99.9 mA, ADC comparator
+ * selected, same sample count.
+ */
 #define I_TERM_BIT					BIT(3)
 #define AUTO_RECHG_BIT					BIT(2)
 #define EN_ANALOG_DROP_IN_VBATT_BIT			BIT(1)
@@ -2016,7 +2027,8 @@ static const struct smb_init_register pmi632_init_seq[] = {
 	  .mask = CHG_EN_SRC_BIT | CHG_EN_POLARITY_BIT |
 		  PRETOFAST_TRANSITION_CFG_BIT | BAT_OV_ECC_BIT | I_TERM_BIT |
 		  SMB5_RECHG_MASK | CHARGER_INHIBIT_BIT,
-	  .val = SMB5_VBAT_BASED_RECHG_BIT | CHARGER_INHIBIT_BIT },
+	  .val = SMB5_VBAT_BASED_RECHG_BIT | CHARGER_INHIBIT_BIT |
+		 I_TERM_BIT },
 	/*
 	 * Take three samples before acting on the voltage comparator, which is
 	 * what the vendor driver asks for whenever it selects VBAT recharge.
