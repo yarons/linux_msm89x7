@@ -715,9 +715,11 @@ struct smb_variant {
  * @fg_full:		The charger has finished a charge on the input that is
  *			still attached, so the pack is full whatever the curve
  *			says, see smb_fg_track_completion()
- * @fg_charge_seen:	A charge has actually been in progress since that input
- *			appeared, which is what makes a later inhibit mean
- *			completion rather than a top-up that was never needed
+ * @fg_charge_seen:	A charge has actually been in progress on this cable,
+ *			which is what makes a later inhibit mean completion
+ *			rather than a top-up that was never needed. Survives a
+ *			momentary loss of the input, which is a fact about the
+ *			cable and not about the pack
  * @fg_charging:	The charger is driving the pack right now, so its terminal
  *			voltage is imposed rather than chosen and says nothing
  *			the OCV table can answer
@@ -1393,8 +1395,25 @@ static bool smb_fg_track_completion(struct smb_chip *chip)
 
 	smb_get_prop_usb_online(chip, &online);
 	if (!online) {
+		/*
+		 * The pack stops being full once charge starts leaving it, so
+		 * that flag goes. Whether a charge was seen does not: it is a
+		 * fact about what happened, and it does not unhappen because
+		 * the input went away for a moment.
+		 *
+		 * That distinction matters because the input does go away for
+		 * a moment. Re-running APSD on a source change drops online
+		 * briefly, and so does anything at the other end of the cable.
+		 * Clearing the history there costs a full pack its full
+		 * reading: the charger settles back into inhibit, inhibit
+		 * without a charge behind it is not full, and the rested OCV
+		 * then pulls a genuinely full battery some six percent down
+		 * the table - exactly the drop the comment above this function
+		 * exists to prevent. Seen three times on a Fairphone 3 before
+		 * it was understood, twice from a cable being handled and once
+		 * from APSD alone.
+		 */
 		chip->fg_full = false;
-		chip->fg_charge_seen = false;
 		chip->fg_charging = false;
 		return false;
 	}
