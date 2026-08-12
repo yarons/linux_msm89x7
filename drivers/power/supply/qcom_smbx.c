@@ -1244,6 +1244,9 @@ static enum power_supply_property smb_batt_properties[] = {
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+	POWER_SUPPLY_PROP_CHARGE_FULL,
+	POWER_SUPPLY_PROP_CHARGE_NOW,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_VOLTAGE_OCV,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
@@ -1783,6 +1786,46 @@ static int smb_fg_start(struct smb_chip *chip)
 	return 0;
 }
 
+/*
+ * How much charge the pack holds, and how much is in it. The percentage above
+ * says nothing about size, and a percentage is all this driver used to report -
+ * which leaves anything wanting to say how long a charge has left with no way
+ * to work it out. UPower derives its estimate from the charge remaining and the
+ * power going in, so without these it can only show a number and no time.
+ *
+ * There is no learned capacity here: this gauge does not measure how the pack
+ * has aged, so full and full-design are the same value, the one the device tree
+ * states. Reporting a learned figure it has not learned would be worse than
+ * reporting the design one.
+ */
+static int smb_get_batt_charge_full(struct smb_chip *chip, int *val)
+{
+	if (!chip->batt_info || chip->batt_info->charge_full_design_uah <= 0)
+		return -ENODATA;
+
+	*val = chip->batt_info->charge_full_design_uah;
+
+	return 0;
+}
+
+static int smb_get_batt_charge_now(struct smb_chip *chip, int *val)
+{
+	if (!smb_fg_available(chip))
+		return -ENODATA;
+
+	guard(mutex)(&chip->fg_lock);
+
+	if (!chip->fg_ready)
+		return -EAGAIN;
+
+	/* soc is in hundredths of a percent, so the divisor is 100 * 100 */
+	*val = div_u64((u64)chip->soc_permyriad *
+			       chip->batt_info->charge_full_design_uah,
+		       100 * 100);
+
+	return 0;
+}
+
 static int smb_get_batt_capacity(struct smb_chip *chip, int *val)
 {
 	int v_uv, cap, rc;
@@ -1872,6 +1915,11 @@ static int smb_batt_get_property(struct power_supply *psy,
 		return 0;
 	case POWER_SUPPLY_PROP_CAPACITY:
 		return smb_get_batt_capacity(chip, &val->intval);
+	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
+	case POWER_SUPPLY_PROP_CHARGE_FULL:
+		return smb_get_batt_charge_full(chip, &val->intval);
+	case POWER_SUPPLY_PROP_CHARGE_NOW:
+		return smb_get_batt_charge_now(chip, &val->intval);
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
 		return smb_get_batt_voltage(chip, false, &val->intval);
 	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
