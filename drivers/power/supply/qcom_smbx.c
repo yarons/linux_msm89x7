@@ -2225,19 +2225,18 @@ static int smb_init_hw(struct smb_chip *chip)
 }
 
 /*
- * Write one four-byte JEITA comparator block from a property on the battery
- * node holding the pair of raw BAT_THERM ADC codes { cold, hot }. Absent
- * property leaves the PMIC's power-on defaults in place.
+ * Write one four-byte JEITA comparator block from a property on this device
+ * holding the pair of raw BAT_THERM ADC codes { cold, hot }. Absent property
+ * leaves the PMIC's power-on defaults in place.
  */
-static int smb_set_jeita_thresholds(struct smb_chip *chip,
-				    struct fwnode_handle *batt,
-				    const char *prop, unsigned int reg)
+static int smb_set_jeita_thresholds(struct smb_chip *chip, const char *prop,
+				    unsigned int reg)
 {
 	u32 thresh[2];
 	u8 buf[JEITA_THRESHOLDS_LEN];
 	int rc;
 
-	rc = fwnode_property_read_u32_array(batt, prop, thresh,
+	rc = device_property_read_u32_array(chip->dev, prop, thresh,
 					    ARRAY_SIZE(thresh));
 	if (rc == -EINVAL)
 		return 0;
@@ -2277,17 +2276,14 @@ static int smb_set_jeita_thresholds(struct smb_chip *chip,
  */
 static int smb_set_recharge_threshold(struct smb_chip *chip)
 {
-	struct fwnode_handle *batt __free(fwnode_handle) =
-		fwnode_find_reference(dev_fwnode(chip->dev),
-				      "monitored-battery", 0);
 	u32 uv, raw;
 	int rc;
 
 	if (!chip->var->rechg_thresh_reg)
 		return 0;
 
-	if (IS_ERR(batt) ||
-	    fwnode_property_read_u32(batt, "qcom,auto-recharge-microvolt", &uv))
+	if (device_property_read_u32(chip->dev, "qcom,auto-recharge-microvolt",
+				     &uv))
 		return 0;
 
 	if (uv >= chip->batt_info->voltage_max_design_uv) {
@@ -2484,13 +2480,13 @@ static int smb_verify_battery_id(struct smb_chip *chip)
 		return 1;
 
 	/* All three have to be described before there is anything to check. */
-	if (fwnode_property_read_u32(batt, "qcom,batt-id-ohm", &expect_ohm) ||
-	    device_property_read_u32(chip->dev, "qcom,batt-id-pullup-ohm",
+	if (fwnode_property_read_u32(batt, "id-resistor-ohms", &expect_ohm) ||
+	    device_property_read_u32(chip->dev, "qcom,batt-id-pullup-ohms",
 				     &pullup_ohm) ||
 	    !chip->bat_id_chan)
 		return 1;
 
-	fwnode_property_read_u32(batt, "qcom,batt-id-tolerance-percent",
+	device_property_read_u32(chip->dev, "qcom,batt-id-tolerance-percent",
 				 &tol_pct);
 
 	rc = iio_read_channel_processed(chip->bat_id_chan, &uv);
@@ -2524,36 +2520,33 @@ static int smb_verify_battery_id(struct smb_chip *chip)
  * enabling; the soft ones only do something once the corresponding
  * compensation bit is set, and then they subtract a fixed offset from the
  * fast-charge current. Express that offset as the current we want to be left
- * with in each soft zone, so the battery node carries a charge current rather
- * than a register delta.
+ * with in each soft zone, so the board carries a charge current rather than a
+ * register delta.
  *
- * All of it is read from the monitored battery, not from this device: which
- * temperatures a cell may be charged at, and how hard, is a property of the
- * cell. A board that fits more than one pack describes each of them.
+ * All of it is read from this device rather than from the monitored battery,
+ * because a threshold here is a raw BAT_THERM ADC code: what code a given
+ * temperature produces depends on this PMIC's ADC full scale and on the
+ * board's pull-up as much as on the cell, so it is not a property of the pack
+ * and cannot travel with one. The soft-zone currents follow the thresholds
+ * they belong to.
  */
 static int smb_init_jeita(struct smb_chip *chip)
 {
-	struct fwnode_handle *batt __free(fwnode_handle) =
-		fwnode_find_reference(dev_fwnode(chip->dev),
-				      "monitored-battery", 0);
 	unsigned int fcc_ua, comp_hot, comp_cold;
 	u32 soft_fcc_ua[2];
 	int rc;
 
-	if (IS_ERR(batt))
-		return 0;
-
-	rc = smb_set_jeita_thresholds(chip, batt, "qcom,jeita-hard-thresholds",
+	rc = smb_set_jeita_thresholds(chip, "qcom,jeita-hard-thresholds",
 				      JEITA_HARD_THRESHOLDS);
 	if (rc < 0)
 		return rc;
 
-	rc = smb_set_jeita_thresholds(chip, batt, "qcom,jeita-soft-thresholds",
+	rc = smb_set_jeita_thresholds(chip, "qcom,jeita-soft-thresholds",
 				      JEITA_SOFT_THRESHOLDS);
 	if (rc < 0)
 		return rc;
 
-	rc = fwnode_property_read_u32_array(batt,
+	rc = device_property_read_u32_array(chip->dev,
 					    "qcom,jeita-soft-fcc-microamp",
 					    soft_fcc_ua,
 					    ARRAY_SIZE(soft_fcc_ua));
