@@ -55,14 +55,62 @@ properties:
 
   monitored-battery: true
 
-  qcom,batt-id-pullup-ohm:
+  qcom,batt-id-pullup-ohms:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: |
       Resistance of the pull-up from the PMIC reference to the BAT_ID net, in
       ohms. Together with the voltage read on the bat_id channel this gives the
       resistance of the identification resistor inside the pack, which is
-      compared against the qcom,batt-id-ohm of the monitored battery. Describe
+      compared against the id-resistor-ohms of the monitored battery. Describe
       it only on boards that route BAT_ID.
+
+  qcom,batt-id-tolerance-percent:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 100
+    description: |
+      How far the resistance measured through that divider may differ from the
+      monitored battery's id-resistor-ohms and still count as the same pack.
+      The tolerance belongs here rather than to the cell because it has to
+      cover the divider and the ADC as well as the resistor itself.
+
+  qcom,auto-recharge-microvolt:
+    description: |
+      Battery voltage, in microvolts, below which a finished charge is started
+      again. Must be below the monitored battery's
+      constant-charge-voltage-max-microvolt. Absent, the comparator keeps
+      whatever threshold it powers up with.
+
+  qcom,jeita-hard-thresholds:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 2
+    maxItems: 2
+    description: |
+      The pair of raw BAT_THERM ADC codes { cold, hot } outside which charging
+      stops outright, cold first. These are codes rather than temperatures
+      because the comparators take codes, and which code a temperature produces
+      depends on this PMIC's ADC full scale and on the board's pull-up as much
+      as on the cell - which is also why they are described here and not on the
+      battery.
+
+  qcom,jeita-soft-thresholds:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 2
+    maxItems: 2
+    description: |
+      The pair of raw BAT_THERM ADC codes { cold, hot } inside which the pack
+      may be charged at full current, in the same units and for the same reason
+      as qcom,jeita-hard-thresholds. Between a soft and a hard threshold the
+      charge current is reduced instead of stopped.
+
+  qcom,jeita-soft-fcc-microamp:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 2
+    maxItems: 2
+    description: |
+      Fast-charge current, in microamperes, to be left with in the cool and the
+      warm soft zone, in that order. The hardware subtracts a fixed offset from
+      whatever current is programmed, so describing the wanted result rather
+      than the offset keeps the property meaningful when the current changes.
 
   qcom,thermal-mitigation:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -146,7 +194,7 @@ examples:
                            "bat_therm", "bat_id";
 
         monitored-battery = <&battery>;
-        qcom,batt-id-pullup-ohm = <100000>;
+        qcom,batt-id-pullup-ohms = <100000>;
         qcom,thermal-mitigation = <2000000 1500000 1000000 500000>;
 
         #cooling-cells = <2>;
