@@ -94,6 +94,7 @@ properties:
     description: battery factory internal resistance
 
   id-resistor-ohms:
+    maxItems: 1
     description: |
       Resistance of the identification resistor built into the pack, on boards
       where more than one battery may be fitted and a charger can tell them
