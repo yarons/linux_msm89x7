@@ -489,6 +489,7 @@
 #define QG_SDAM_SOC					(QG_SDAM_BASE + 0x47)	/* 1 byte, percent */
 #define QG_SDAM_MAGIC					(QG_SDAM_BASE + 0x80)	/* 4 bytes */
 #define QG_SDAM_MAGIC_VALUE				0x736d6278		/* "smbx" */
+#define QG_SDAM_FULL					(QG_SDAM_BASE + 0x84)	/* 2 bytes, mAh */
 
 /*
  * How often the gauge integrates, and the current below which a wake sample is
@@ -517,6 +518,21 @@
  * charge.
  */
 #define SMB_FG_SEED_DISAGREE				(10 * 100)
+
+/*
+ * Learning the pack's real capacity. A span has to be long enough that the
+ * error in its two endpoints is small beside it - half the pack keeps a
+ * percent of endpoint error under two percent of the answer - and the result
+ * is blended rather than taken, so one bad span moves the number a quarter of
+ * the way and the next good one pulls it back. The clamp is not a refinement
+ * but a guard: a pack that measures outside it is a measurement fault, not an
+ * aged battery.
+ */
+#define SMB_FG_LEARN_MIN_SPAN				(50 * 100)
+#define SMB_FG_LEARN_BLEND_NUM				1
+#define SMB_FG_LEARN_BLEND_DEN				4
+#define SMB_FG_LEARN_MIN_PCT				50
+#define SMB_FG_LEARN_MAX_PCT				110
 
 #define SDP_CURRENT_UA					500000
 #define CDP_CURRENT_UA					1500000
@@ -723,6 +739,16 @@ struct smb_variant {
  * @fg_charging:	The charger is driving the pack right now, so its terminal
  *			voltage is imposed rather than chosen and says nothing
  *			the OCV table can answer
+ * @charge_full_uah:	What the pack actually holds, learned from spans between
+ *			trusted anchors. Seeded from the device tree's design
+ *			value, which is a nameplate for a new cell and not a
+ *			statement about the one that is fitted
+ * @fg_learn_ua_ms:	Charge counted since the last anchor, in microamp-
+ *			milliseconds and signed, so that its sign says which way
+ *			the span ran
+ * @fg_learn_soc:	State of charge at the last anchor, or -1 when there is
+ *			no span in progress - which is also how a span that
+ *			cannot be trusted is thrown away
  */
 struct smb_chip {
 	struct device *dev;
@@ -761,6 +787,9 @@ struct smb_chip {
 	bool fg_charging;
 	/* Last hardware rest-OCV harvested, to tell a fresh capture from a stale one */
 	int fg_good_ocv_uv;
+	int charge_full_uah;
+	s64 fg_learn_ua_ms;
+	int fg_learn_soc;
 };
 
 static enum power_supply_property smb_properties[] = {
@@ -1446,6 +1475,76 @@ static bool smb_fg_track_completion(struct smb_chip *chip)
 }
 
 /**
+ * smb_fg_anchor() - close the span that ended here, and learn from it
+ * @chip: the charger
+ * @soc: the state of charge this anchor establishes, in hundredths of a percent
+ *
+ * The gauge counts charge between points it trusts and is corrected at them.
+ * Those same points bound a measurement nothing else in this driver can make:
+ * the charge that flowed between two known states of charge is the size of the
+ * pack, and the pack is not the size the device tree states. That value is a
+ * nameplate for a new cell; measured here, an aged one delivered barely seventy
+ * percent of it, and every percentage the gauge reported was wrong by the
+ * difference.
+ *
+ * Only spans that are actually accountable are used. A span is thrown away -
+ * @fg_learn_soc set to -1 - wherever charge moved without being counted, which
+ * is what a suspend gap is, so a short measurement is preferred to a long one
+ * with a hole in it.
+ *
+ * Caller holds @fg_lock.
+ */
+static void smb_fg_anchor(struct smb_chip *chip, int soc)
+{
+	int span, learned, full, lo, hi;
+	s64 uah;
+
+	if (chip->fg_learn_soc >= 0) {
+		span = soc - chip->fg_learn_soc;
+		uah = div_s64(chip->fg_learn_ua_ms, 3600 * 1000);
+
+		/*
+		 * The span and the charge have to agree about which way the
+		 * pack went. When they do not, something moved that was not
+		 * counted, and the arithmetic below would divide a partial
+		 * charge by a full span and learn a pack that is too small.
+		 */
+		if (abs(span) >= SMB_FG_LEARN_MIN_SPAN &&
+		    ((span > 0) == (uah > 0))) {
+			learned = div_s64(abs(uah) * 100 * 100, abs(span));
+
+			/*
+			 * Blend rather than jump. A learned capacity that
+			 * follows the last span is as noisy as that span; one
+			 * that moves a quarter of the way each time settles on
+			 * the pack and rides out a bad measurement.
+			 */
+			full = chip->charge_full_uah +
+			       (learned - chip->charge_full_uah) *
+					       SMB_FG_LEARN_BLEND_NUM /
+					       SMB_FG_LEARN_BLEND_DEN;
+
+			lo = chip->batt_info->charge_full_design_uah /
+			     100 * SMB_FG_LEARN_MIN_PCT;
+			hi = chip->batt_info->charge_full_design_uah /
+			     100 * SMB_FG_LEARN_MAX_PCT;
+			full = clamp(full, lo, hi);
+
+			if (full != chip->charge_full_uah) {
+				dev_info(chip->dev,
+					 "fg: span %d.%02d%% carried %lld uAh -> pack %d uAh, learned %d uAh\n",
+					 abs(span) / 100, abs(span) % 100,
+					 abs(uah), learned, full);
+				chip->charge_full_uah = full;
+			}
+		}
+	}
+
+	chip->fg_learn_soc = soc;
+	chip->fg_learn_ua_ms = 0;
+}
+
+/**
  * smb_fg_take_good_ocv() - anchor to the gauge's own rested OCV when it is fresh
  * @chip: the charger
  * @changed: set to whether the reported percent moved, if a reading is taken
@@ -1480,6 +1579,7 @@ static bool smb_fg_take_good_ocv(struct smb_chip *chip, bool *changed)
 		return false;
 
 	was = chip->fg_ready ? chip->soc_permyriad : -1;
+	smb_fg_anchor(chip, gsoc);
 	chip->soc_permyriad = gsoc;
 	chip->fg_residue = 0;
 	chip->fg_ready = true;
@@ -1538,6 +1638,7 @@ static bool smb_fg_update(struct smb_chip *chip)
 		guard(mutex)(&chip->fg_lock);
 
 		was = chip->fg_ready ? chip->soc_permyriad : -1;
+		smb_fg_anchor(chip, 100 * 100);
 		chip->soc_permyriad = 100 * 100;
 		chip->fg_residue = 0;
 		chip->fg_ready = true;
@@ -1578,6 +1679,7 @@ static bool smb_fg_update(struct smb_chip *chip)
 		 * since there is no better number to start from; the first rest
 		 * correction puts it right.
 		 */
+		smb_fg_anchor(chip, soc_ocv);
 		chip->soc_permyriad = soc_ocv;
 		chip->fg_residue = 0;
 		chip->fg_ready = true;
@@ -1595,10 +1697,19 @@ static bool smb_fg_update(struct smb_chip *chip)
 		if (abs(i_ua) <= SMB_FG_OCV_QUIET_UA)
 			chip->soc_permyriad = soc_ocv;
 		chip->fg_residue = 0;
+		/*
+		 * Nothing was counted across the gap, so whatever span was in
+		 * progress has a hole in it. A quiet wake sample is a rest OCV
+		 * and starts a new span; anything else leaves none.
+		 */
+		if (abs(i_ua) <= SMB_FG_OCV_QUIET_UA)
+			smb_fg_anchor(chip, chip->soc_permyriad);
+		else
+			chip->fg_learn_soc = -1;
 	} else {
 		/*
 		 * charge (uAh) = i_ua * elapsed / 3600, and one percent of the
-		 * pack is charge_full_design_uah / 100, so a hundredth of a
+		 * pack is charge_full_uah / 100, so a hundredth of a
 		 * percent per millisecond is i_ua * elapsed_ms / (360 * full).
 		 *
 		 * At a tenth of an amp that quotient is under one per poll, so
@@ -1606,10 +1717,11 @@ static bool smb_fg_update(struct smb_chip *chip)
 		 * discarded it would be a standing error in the rate itself,
 		 * always in the direction of counting too little.
 		 */
-		s64 per_permyriad = 360LL * chip->batt_info->charge_full_design_uah;
+		s64 per_permyriad = 360LL * chip->charge_full_uah;
 		s64 step;
 
 		chip->fg_residue += (s64)i_ua * elapsed_ms;
+		chip->fg_learn_ua_ms += (s64)i_ua * elapsed_ms;
 		step = div_s64(chip->fg_residue, per_permyriad);
 		chip->fg_residue -= step * per_permyriad;
 
@@ -1636,11 +1748,21 @@ static bool smb_fg_update(struct smb_chip *chip)
 static void smb_fg_sdam_store(struct smb_chip *chip)
 {
 	unsigned int soc;
+	__le16 full;
 
-	scoped_guard(mutex, &chip->fg_lock)
+	scoped_guard(mutex, &chip->fg_lock) {
 		soc = clamp(DIV_ROUND_CLOSEST(chip->soc_permyriad, 100), 0, 100);
+		full = cpu_to_le16(chip->charge_full_uah / 1000);
+	}
 
 	regmap_write(chip->regmap, QG_SDAM_SOC, soc);
+	/*
+	 * The learned capacity goes with it, in mAh, which is finer than the
+	 * learning ever resolves and fits two bytes. Without this a pack has to
+	 * be relearned from scratch after every reboot, and the spans this
+	 * gauge can trust are hours long.
+	 */
+	regmap_bulk_write(chip->regmap, QG_SDAM_FULL, &full, sizeof(full));
 }
 
 /*
@@ -1662,6 +1784,36 @@ static bool smb_fg_sdam_restore(struct smb_chip *chip, int *soc_permyriad)
 
 	*soc_permyriad = soc * 100;
 	return true;
+}
+
+/*
+ * Restore the learned capacity, guarded by the same magic - so a battery swap,
+ * which clears it, correctly falls back to the design value for a pack this
+ * driver has never measured. The clamp is applied again on the way in: a stored
+ * value outside it was not written by any span this driver would have accepted.
+ */
+static void smb_fg_sdam_restore_full(struct smb_chip *chip)
+{
+	__le32 magic;
+	__le16 stored;
+	int full, lo, hi;
+
+	if (regmap_bulk_read(chip->regmap, QG_SDAM_MAGIC, &magic, sizeof(magic)))
+		return;
+	if (le32_to_cpu(magic) != QG_SDAM_MAGIC_VALUE)
+		return;
+	if (regmap_bulk_read(chip->regmap, QG_SDAM_FULL, &stored, sizeof(stored)))
+		return;
+
+	full = le16_to_cpu(stored) * 1000;
+	lo = chip->batt_info->charge_full_design_uah / 100 * SMB_FG_LEARN_MIN_PCT;
+	hi = chip->batt_info->charge_full_design_uah / 100 * SMB_FG_LEARN_MAX_PCT;
+	if (full < lo || full > hi)
+		return;
+
+	chip->charge_full_uah = full;
+	dev_dbg(chip->dev, "fg: restored learned capacity %d uAh from sdam\n",
+		full);
 }
 
 static void smb_fg_work(struct work_struct *work)
@@ -1703,6 +1855,14 @@ static int smb_fg_start(struct smb_chip *chip)
 	if (rc)
 		return rc;
 
+	/*
+	 * Start from the nameplate and let the pack correct it. A driver that
+	 * has measured nothing yet has nothing better to say than what the
+	 * device tree states.
+	 */
+	chip->charge_full_uah = chip->batt_info->charge_full_design_uah;
+	chip->fg_learn_soc = -1;
+
 	/* The gauge's freshest rested capture, where it holds one. */
 	if (smb_qg_read_sample(chip, QG_S3_GOOD_OCV_V_DATA0, &v_uv, &i_ua) == 0) {
 		rest_soc = smb_ocv_to_permyriad(chip, smb_batt_ocv(chip, v_uv, i_ua));
@@ -1724,6 +1884,8 @@ static int smb_fg_start(struct smb_chip *chip)
 	 * now - so take it, and say so, because a seed being overruled is worth
 	 * knowing about.
 	 */
+	smb_fg_sdam_restore_full(chip);
+
 	if (smb_fg_sdam_restore(chip, &soc)) {
 		if (rest_soc >= 0 && abs(rest_soc - soc) > SMB_FG_SEED_DISAGREE) {
 			dev_info(chip->dev,
@@ -1793,17 +1955,29 @@ static int smb_fg_start(struct smb_chip *chip)
  * to work it out. UPower derives its estimate from the charge remaining and the
  * power going in, so without these it can only show a number and no time.
  *
- * There is no learned capacity here: this gauge does not measure how the pack
- * has aged, so full and full-design are the same value, the one the device tree
- * states. Reporting a learned figure it has not learned would be worse than
- * reporting the design one.
+ * Full and full-design are not the same number. The design value is what the
+ * device tree states, which is a nameplate for a new cell; full is what the
+ * spans between trusted anchors say the pack fitted here actually holds. On the
+ * pack this was developed against those differ by nearly thirty percent, and
+ * reporting the nameplate as the capacity made every percentage the gauge
+ * derived from it wrong by that much.
  */
-static int smb_get_batt_charge_full(struct smb_chip *chip, int *val)
+static int smb_get_batt_charge_full_design(struct smb_chip *chip, int *val)
 {
 	if (!chip->batt_info || chip->batt_info->charge_full_design_uah <= 0)
 		return -ENODATA;
 
 	*val = chip->batt_info->charge_full_design_uah;
+
+	return 0;
+}
+
+static int smb_get_batt_charge_full(struct smb_chip *chip, int *val)
+{
+	if (!chip->batt_info || chip->batt_info->charge_full_design_uah <= 0)
+		return -ENODATA;
+
+	*val = chip->charge_full_uah ?: chip->batt_info->charge_full_design_uah;
 
 	return 0;
 }
@@ -1819,8 +1993,7 @@ static int smb_get_batt_charge_now(struct smb_chip *chip, int *val)
 		return -EAGAIN;
 
 	/* soc is in hundredths of a percent, so the divisor is 100 * 100 */
-	*val = div_u64((u64)chip->soc_permyriad *
-			       chip->batt_info->charge_full_design_uah,
+	*val = div_u64((u64)chip->soc_permyriad * chip->charge_full_uah,
 		       100 * 100);
 
 	return 0;
@@ -1916,6 +2089,7 @@ static int smb_batt_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CAPACITY:
 		return smb_get_batt_capacity(chip, &val->intval);
 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
+		return smb_get_batt_charge_full_design(chip, &val->intval);
 	case POWER_SUPPLY_PROP_CHARGE_FULL:
 		return smb_get_batt_charge_full(chip, &val->intval);
 	case POWER_SUPPLY_PROP_CHARGE_NOW:
