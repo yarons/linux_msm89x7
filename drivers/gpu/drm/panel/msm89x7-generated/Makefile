@@ -18,6 +18,7 @@ obj-$(CONFIG_DRM_PANEL_NOKIA_ND1_ILI7807E) += panel-nokia-nd1-ili7807e.o
 obj-$(CONFIG_DRM_PANEL_NOKIA_ND1_NT35521) += panel-nokia-nd1-nt35521.o
 obj-$(CONFIG_DRM_PANEL_NOKIA_ND1_NT35521S) += panel-nokia-nd1-nt35521s.o
 obj-$(CONFIG_DRM_PANEL_NOKIA_ND1_NT35521S_PJ050IA) += panel-nokia-nd1-nt35521s-pj050ia.o
+obj-$(CONFIG_DRM_PANEL_SAMSUNG_GTOWIFI_ILI9881C_LD) += panel-samsung-gtowifi-ili9881c-ld.o
 obj-$(CONFIG_DRM_PANEL_XIAOMI_LAND_HX8394F_BOE) += panel-xiaomi-land-hx8394f-boe.o
 obj-$(CONFIG_DRM_PANEL_XIAOMI_LAND_ILI9881C_TIANMA) += panel-xiaomi-land-ili9881c-tianma.o
 obj-$(CONFIG_DRM_PANEL_XIAOMI_LAND_NT35521S_EBBG) += panel-xiaomi-land-nt35521s-ebbg.o
