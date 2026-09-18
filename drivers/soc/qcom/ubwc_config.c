@@ -272,6 +272,8 @@ static const struct of_device_id qcom_ubwc_configs[] __maybe_unused = {
 	{ .compatible = "qcom,sc8180x", .data = &sc8180x_data, },
 	{ .compatible = "qcom,sc8280xp", .data = &sc8280xp_data, },
 	{ .compatible = "qcom,sda660", .data = &msm8937_data },
+	{ .compatible = "qcom,sdm429", .data = &msm8937_data },
+	{ .compatible = "qcom,sdm439", .data = &msm8937_data },
 	{ .compatible = "qcom,sdm450", .data = &msm8937_data },
 	{ .compatible = "qcom,sdm630", .data = &msm8937_data },
 	{ .compatible = "qcom,sdm632", .data = &msm8937_data },
