@@ -253,6 +253,59 @@
 	status = "okay";
 };
 
+&mdss {
+	status = "okay";
+};
+
+&mdss_dsi0 {
+	/*
+	 * Vendor tree (sdm439-pm8953.dtsi, confirmed in the live DT of this
+	 * tablet): the DSI "vdda" rail of the 12nm parts is L23 at 0.8 V, not
+	 * the 1.2 V L2 of the 28nm MSM8937. L6 is the 1.8 V supply of the
+	 * vendor DSI ctrl node, which is also the only PMIC supply of the
+	 * panel (its I/O voltage).
+	 */
+	vdda-supply = <&pm8953_l23>;
+	vddio-supply = <&pm8953_l6>;
+
+	status = "okay";
+
+	panel@0 {
+		compatible = "samsung,gtowifi-ili9881c-ld";
+		reg = <0>;
+
+		/*
+		 * The panel bias (vendor "lab"/"ibb", 5.5 V from the PMI632
+		 * LCDB block) has no driver here and is left as the bootloader
+		 * set it up. The same goes for the backlight: there is
+		 * deliberately no backlight property, so that nothing can turn
+		 * off what the bootloader left on.
+		 */
+		reset-gpios = <&tlmm 60 GPIO_ACTIVE_LOW>;
+
+		pinctrl-0 = <&panel_default>;
+		pinctrl-names = "default";
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&mdss_dsi0_out>;
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	data-lanes = <0 1 2 3>;
+	remote-endpoint = <&panel_in>;
+};
+
+&mdss_dsi0_phy {
+	/* 1.8 V "vddio" of the vendor qcom,phy-supply-entries */
+	vddio-supply = <&pm8953_l5>;
+
+	status = "okay";
+};
+
 &pm8953_gpios {
 	/* GPIO3 and GPIO6 are disallowed by the vendor tree */
 	gpio-reserved-ranges = <2 1>, <5 1>;
@@ -553,6 +606,13 @@
 		function = "gpio";
 		drive-strength = <2>;
 		bias-pull-up;
+	};
+
+	panel_default: panel-default-state {
+		pins = "gpio60";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
 	};
 
 	sdc2_cd_default: sdc2-cd-default-state {
