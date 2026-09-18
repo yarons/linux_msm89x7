@@ -318,6 +318,7 @@ sc8280xp-microsoft-blackrock-el2-dtbs	:= sc8280xp-microsoft-blackrock.dtb sc8280
 dtb-$(CONFIG_ARCH_QCOM)	+= sc8280xp-microsoft-blackrock.dtb sc8280xp-microsoft-blackrock-el2.dtb
 dtb-$(CONFIG_ARCH_QCOM)	+= sda660-inforce-ifc6560.dtb
 dtb-$(CONFIG_ARCH_QCOM)	+= sdm429-lenovo-tbx505x.dtb
+dtb-$(CONFIG_ARCH_QCOM)	+= sdm429-samsung-gtowifi.dtb
 dtb-$(CONFIG_ARCH_QCOM)	+= sdm429w-fossil-hoki.dtb
 dtb-$(CONFIG_ARCH_QCOM)	+= sdm429w-mobvoi-rover.dtb
 dtb-$(CONFIG_ARCH_QCOM)	+= sdm439-nokia-panther.dtb
