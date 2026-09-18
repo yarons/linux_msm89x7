@@ -1319,18 +1319,14 @@ static int dsi_12nm_phy_enable(struct msm_dsi_phy *phy,
 		dev_warn(dev, "PHY enabled while the PLL is still prepared\n");
 
 	/*
-	 * The 12nm PHY takes care of the clock lane timing on its own and the
-	 * vendor driver leaves DSI_CLKOUT_TIMING_CTRL of the host alone for
-	 * it. The msm DSI host always writes that register from the shared
-	 * timings, so give it the spec derived values that the 28nm PHYs on
-	 * the same DSI controller use. The PHY register values calculated by
-	 * this helper do not apply to the 12nm PHY and are not used.
+	 * The 12nm PHY takes care of the clock lane timing on its own: the
+	 * vendor driver and LK never write DSI_CLKOUT_TIMING_CTRL of the host
+	 * for it, and the register reads 0 while the boot loader drives the
+	 * panel. The msm DSI host always writes it from the shared timings,
+	 * so hand it zeros to end up in the same state.
 	 */
-	if (msm_dsi_dphy_timing_calc(&phy->timing, clk_req)) {
-		DRM_DEV_ERROR(dev, "%s: D-PHY timing calculation failed\n",
-			      __func__);
-		return -EINVAL;
-	}
+	memset(&phy->timing.shared_timings, 0,
+	       sizeof(phy->timing.shared_timings));
 
 	t = dsi_12nm_phy_get_timing(phy, clk_req->bitclk_rate);
 
