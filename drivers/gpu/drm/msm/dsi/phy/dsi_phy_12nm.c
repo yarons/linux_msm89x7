@@ -54,6 +54,15 @@
  * the VCO .prepare callback. A PHY reset (done by the DSI host before every PHY
  * enable) therefore cannot lose PLL state, and no save/restore_pll_state
  * callbacks are needed.
+ *
+ * Boot loader handoff: the boot loader leaves the PLL running for its splash
+ * screen, and a simple-framebuffer node typically holds the DSI byte and pixel
+ * clocks. As soon as this PHY registers as their clock provider, the clk core
+ * moves those prepare counts onto the PLL and calls the VCO .prepare while the
+ * splash is still being scanned out. Like pll_vco_handoff_12nm() of the vendor
+ * driver, .prepare therefore adopts a PLL that is found running and locked
+ * instead of touching it, and the rates are read back from the hardware when
+ * the clocks are registered.
  */
 
 /*
@@ -729,17 +738,101 @@ static void pll_12nm_stop(struct dsi_pll_12nm *pll)
 	ndelay(500);	/* h/w recommended delay */
 }
 
-/* mdss_dsi_12nm_phy_hstx_drv_ctrl() */
+static const u16 dsi_12nm_phy_hstx_driv_regs[] = {
+	REG_DSI_12nm_PHY_HSTX_DRIV_INDATA_CTRL_CLKLANE,
+	REG_DSI_12nm_PHY_HSTX_DRIV_INDATA_CTRL_LANE0,
+	REG_DSI_12nm_PHY_HSTX_DRIV_INDATA_CTRL_LANE1,
+	REG_DSI_12nm_PHY_HSTX_DRIV_INDATA_CTRL_LANE2,
+	REG_DSI_12nm_PHY_HSTX_DRIV_INDATA_CTRL_LANE3,
+};
+
+/*
+ * mdss_dsi_12nm_phy_hstx_drv_ctrl(). Registers that already hold the wanted
+ * value are left alone, so that adopting a running link writes nothing.
+ */
 static void dsi_12nm_phy_hstx_drv_ctrl(struct msm_dsi_phy *phy, bool enable)
 {
 	void __iomem *base = phy->base;
 	u32 data = enable ? DSI_12nm_PHY_HSTX_DRIV_INDATA_CTRL_ENABLE : 0;
+	int i;
 
-	writel(data, base + REG_DSI_12nm_PHY_HSTX_DRIV_INDATA_CTRL_CLKLANE);
-	writel(data, base + REG_DSI_12nm_PHY_HSTX_DRIV_INDATA_CTRL_LANE0);
-	writel(data, base + REG_DSI_12nm_PHY_HSTX_DRIV_INDATA_CTRL_LANE1);
-	writel(data, base + REG_DSI_12nm_PHY_HSTX_DRIV_INDATA_CTRL_LANE2);
-	writel(data, base + REG_DSI_12nm_PHY_HSTX_DRIV_INDATA_CTRL_LANE3);
+	for (i = 0; i < ARRAY_SIZE(dsi_12nm_phy_hstx_driv_regs); i++)
+		if (readl(base + dsi_12nm_phy_hstx_driv_regs[i]) != data)
+			writel(data, base + dsi_12nm_phy_hstx_driv_regs[i]);
+}
+
+/*
+ * A PLL that is running although this driver did not start it, in practice
+ * the one the boot loader uses for its splash screen. The vendor handoff
+ * (pll_vco_handoff_12nm()) only looks at the lock bit; SYS_CTRL and the power
+ * up override are checked as well here so that a PLL which pll_12nm_stop()
+ * has forced off is never taken for a running one.
+ */
+static bool pll_12nm_is_running(struct dsi_pll_12nm *pll)
+{
+	void __iomem *base = pll->phy->base;
+	u32 data;
+
+	data = readl(base + REG_DSI_12nm_PHY_SYS_CTRL);
+	if (!(data & DSI_12nm_PHY_SYS_CTRL_PHY_ENABLED))
+		return false;
+
+	data = readl(base + REG_DSI_12nm_PHY_PLL_POWERUP_CTRL);
+	data &= DSI_12nm_PHY_PLL_POWERUP_CTRL_ONPLL_OVR_EN |
+		DSI_12nm_PHY_PLL_POWERUP_CTRL_ONPLL_OVR;
+	if (data == DSI_12nm_PHY_PLL_POWERUP_CTRL_ONPLL_OVR_EN)
+		return false;
+
+	data = readl(base + REG_DSI_12nm_PHY_STAT0);
+
+	return data & DSI_12nm_PHY_STAT0_PLL_LOCKED;
+}
+
+/*
+ * VCO rate as programmed in the hardware. pll_vco_get_rate_12nm() only looks
+ * at the integer feedback divider, which is floored to VCO_REF_CLK_RATE / 4.
+ * If the SSC block is on, it also holds the fractional part: undo
+ * pll_12nm_calc_ssc() to get the exact rate, and fall back to the integer one
+ * if the result is not within that quarter step.
+ */
+static unsigned long pll_12nm_read_vco_rate(struct dsi_pll_12nm *pll)
+{
+	void __iomem *base = pll->phy->base;
+	u32 m_div, mint, quot, rem, den;
+	u64 rate, frac_rate, temp;
+
+	m_div = readl(base + REG_DSI_12nm_PHY_PLL_LOOP_DIV_RATIO_1) & 0x3f;
+	m_div <<= 6;
+	m_div |= readl(base + REG_DSI_12nm_PHY_PLL_LOOP_DIV_RATIO_0) & 0x3f;
+
+	rate = div_u64((u64)VCO_REF_CLK_RATE * m_div, 4);
+
+	if ((readl(base + REG_DSI_12nm_PHY_SSC0) &
+	     DSI_12nm_PHY_SSC0_SSC_ENABLE) != DSI_12nm_PHY_SSC0_SSC_ENABLE)
+		return rate;
+
+	mint = (readl(base + REG_DSI_12nm_PHY_SSC7) & 0xff) |
+	       (readl(base + REG_DSI_12nm_PHY_SSC8) & 0xff) << 8;
+	quot = (readl(base + REG_DSI_12nm_PHY_SSC10) & 0xff) |
+	       (readl(base + REG_DSI_12nm_PHY_SSC11) & 0xff) << 8;
+	rem = (readl(base + REG_DSI_12nm_PHY_SSC12) & 0xff) |
+	      (readl(base + REG_DSI_12nm_PHY_SSC13) & 0xff) << 8;
+	den = (readl(base + REG_DSI_12nm_PHY_SSC14) & 0xff) |
+	      (readl(base + REG_DSI_12nm_PHY_SSC15) & 0xff) << 8;
+
+	/* mint = 4 * multiplier - 32, in steps of a quarter of the reference */
+	frac_rate = (u64)(VCO_REF_CLK_RATE / 4) * (mint + 32);
+
+	/* the rest below that step, from quot and rem / den of it * 2^17 / ref */
+	temp = (u64)quot * VCO_REF_CLK_RATE;
+	if (den)
+		temp += div_u64((u64)rem * VCO_REF_CLK_RATE, den);
+	frac_rate += DIV_ROUND_CLOSEST_ULL(temp, BIT(17));
+
+	if (frac_rate < rate || frac_rate - rate >= VCO_REF_CLK_RATE / 4)
+		return rate;
+
+	return frac_rate;
 }
 
 /*
@@ -764,29 +857,38 @@ static unsigned long dsi_pll_12nm_vco_recalc_rate(struct clk_hw *hw,
 						  unsigned long parent_rate)
 {
 	struct dsi_pll_12nm *pll = to_pll_12nm(hw);
-	void __iomem *base = pll->phy->base;
-	u32 m_div;
 
 	if (!pll->vco_rate_valid) {
-		/*
-		 * pll_vco_get_rate_12nm(). This ignores the fractional part
-		 * that is programmed along with SSC, so it can be off by up
-		 * to VCO_REF_CLK_RATE / 4.
-		 */
-		m_div = readl(base + REG_DSI_12nm_PHY_PLL_LOOP_DIV_RATIO_1);
-		m_div = (m_div & 0x3f) << 6;
-		m_div |= readl(base + REG_DSI_12nm_PHY_PLL_LOOP_DIV_RATIO_0) &
-			 0x3f;
-
-		pll->vco_rate = div_u64((u64)VCO_REF_CLK_RATE * m_div, 4);
+		pll->vco_rate = pll_12nm_read_vco_rate(pll);
 		pll->vco_rate_valid = true;
-
-		DBG("DSI PLL%d m_div=%u", pll->phy->id, m_div);
 	}
 
 	DBG("DSI PLL%d returning vco rate = %lu", pll->phy->id, pll->vco_rate);
 
 	return pll->vco_rate;
+}
+
+/*
+ * Take over a running PLL, see the handoff note at the top. Nothing is written
+ * if the hardware is in the state the boot loader leaves it in.
+ */
+static void pll_12nm_adopt(struct dsi_pll_12nm *pll)
+{
+	struct device *dev = &pll->phy->pdev->dev;
+	unsigned long hw_rate = pll_12nm_read_vco_rate(pll);
+	enum dsi_pll_12nm_div_id id;
+	bool match = hw_rate == pll->vco_rate;
+
+	for (id = 0; id < DSI_PLL_12NM_NUM_DIVS; id++)
+		if (pll_12nm_div_read_hw(pll, id) != pll_12nm_div_val(pll, id))
+			match = false;
+
+	if (match)
+		dev_info(dev, "DSI PLL%d: adopting the running PLL, VCO at %lu Hz\n",
+			 pll->phy->id, hw_rate);
+	else
+		dev_warn(dev, "DSI PLL%d: adopting the running PLL at %lu Hz, but %lu Hz was set\n",
+			 pll->phy->id, hw_rate, pll->vco_rate);
 }
 
 static int dsi_pll_12nm_vco_prepare(struct clk_hw *hw)
@@ -795,6 +897,7 @@ static int dsi_pll_12nm_vco_prepare(struct clk_hw *hw)
 	struct device *dev = &pll->phy->pdev->dev;
 	void __iomem *base = pll->phy->base;
 	struct dsi_pll_12nm_param param = { };
+	bool adopted = false;
 	u32 data;
 	int ret;
 
@@ -815,10 +918,17 @@ static int dsi_pll_12nm_vco_prepare(struct clk_hw *hw)
 	 * With the msm DSI host the first case is not expected: the PHY is
 	 * reset and dsi_12nm_phy_enable() shuts it down before the link
 	 * clocks, and with them this PLL, are turned on.
+	 *
+	 * Before either of them: a PLL that already runs must not be pulsed
+	 * through SYS_CTRL under a live link, it is adopted as it is.
 	 */
 	data = readl(base + REG_DSI_12nm_PHY_SYS_CTRL);
-	if (data & DSI_12nm_PHY_SYS_CTRL_PHY_ENABLED) {
-		dev_dbg(dev, "DSI PLL%d: PHY is up, relocking\n", pll->phy->id);
+	if (pll_12nm_is_running(pll)) {
+		pll_12nm_adopt(pll);
+		adopted = true;
+		ret = 0;
+	} else if (data & DSI_12nm_PHY_SYS_CTRL_PHY_ENABLED) {
+		dev_info(dev, "DSI PLL%d: PHY is up, relocking\n", pll->phy->id);
 		ret = pll_12nm_relock(pll);
 	} else {
 		pll_12nm_calc_reg(pll, &param);
@@ -842,8 +952,9 @@ static int dsi_pll_12nm_vco_prepare(struct clk_hw *hw)
 
 	/* pll_vco_enable_12nm(): let the pixel (GP) clock out */
 	data = readl(base + REG_DSI_12nm_PHY_SSC0);
-	data |= DSI_12nm_PHY_SSC0_GP_CLK_EN;
-	writel(data, base + REG_DSI_12nm_PHY_SSC0);
+	if (!(data & DSI_12nm_PHY_SSC0_GP_CLK_EN))
+		writel(data | DSI_12nm_PHY_SSC0_GP_CLK_EN,
+		       base + REG_DSI_12nm_PHY_SSC0);
 
 	/*
 	 * mdss_dsi_post_clkon_cb(): the vendor driver turns the HS TX drivers
@@ -853,7 +964,7 @@ static int dsi_pll_12nm_vco_prepare(struct clk_hw *hw)
 	 */
 	dsi_12nm_phy_hstx_drv_ctrl(pll->phy, true);
 
-	DBG("DSI PLL%d lock success", pll->phy->id);
+	DBG("DSI PLL%d %s", pll->phy->id, adopted ? "adopted" : "lock success");
 	pll->phy->pll_on = true;
 
 	return 0;
@@ -876,6 +987,12 @@ static void dsi_pll_12nm_vco_unprepare(struct clk_hw *hw)
 	pll->phy->pll_on = false;
 }
 
+/* Hardware state, for the clk core's view of a PLL the boot loader started */
+static int dsi_pll_12nm_vco_is_prepared(struct clk_hw *hw)
+{
+	return pll_12nm_is_running(to_pll_12nm(hw));
+}
+
 static int dsi_pll_12nm_vco_determine_rate(struct clk_hw *hw,
 					   struct clk_rate_request *req)
 {
@@ -894,6 +1011,7 @@ static const struct clk_ops clk_ops_dsi_pll_12nm_vco = {
 	.recalc_rate = dsi_pll_12nm_vco_recalc_rate,
 	.prepare = dsi_pll_12nm_vco_prepare,
 	.unprepare = dsi_pll_12nm_vco_unprepare,
+	.is_prepared = dsi_pll_12nm_vco_is_prepared,
 };
 
 /*
@@ -1190,6 +1308,15 @@ static int dsi_12nm_phy_enable(struct msm_dsi_phy *phy,
 		DRM_DEV_ERROR(dev, "bonded DSI is not supported on the 12nm PHY\n");
 		return -EINVAL;
 	}
+
+	/*
+	 * The host resets the PHY before it gets here, which takes a running
+	 * PLL down without the clk core knowing. With the msm DSI host the
+	 * link clocks are off at this point; anything else (say a splash
+	 * framebuffer that still holds them) would leave a dead PLL behind.
+	 */
+	if (phy->pll_on)
+		dev_warn(dev, "PHY enabled while the PLL is still prepared\n");
 
 	/*
 	 * The 12nm PHY takes care of the clock lane timing on its own and the
