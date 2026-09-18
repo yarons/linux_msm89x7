@@ -29,9 +29,11 @@ properties:
       - description: dsi pll register set
       - description: dsi phy register set
       - description:
-          dsi phy regulator register set. The 12nm PHY has no regulator
-          registers to program, the region is accepted so that the node can
-          keep the layout of the 28nm PHY node it replaces.
+          Not part of the PHY and not used. The 12nm PHY has no regulator
+          registers. Existing device trees list the MMSS misc block (DSI ULPS
+          clamp and PHY reset controls) here under the name that the 28nm PHY
+          node they override uses for its regulator registers; the entry is
+          only accepted for their sake and should be left out of new ones.
 
   reg-names:
     minItems: 2
