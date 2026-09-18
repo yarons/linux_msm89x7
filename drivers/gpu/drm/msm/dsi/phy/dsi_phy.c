@@ -548,6 +548,10 @@ static const struct of_device_id dsi_phy_dt_match[] = {
 	{ .compatible = "qcom,sm6150-dsi-phy-14nm",
 	  .data = &dsi_phy_14nm_6150_cfgs },
 #endif
+#ifdef CONFIG_DRM_MSM_DSI_12NM_PHY
+	{ .compatible = "qcom,dsi-phy-12nm",
+	  .data = &dsi_phy_12nm_cfgs },
+#endif
 #ifdef CONFIG_DRM_MSM_DSI_10NM_PHY
 	{ .compatible = "qcom,dsi-phy-10nm",
 	  .data = &dsi_phy_10nm_cfgs },
