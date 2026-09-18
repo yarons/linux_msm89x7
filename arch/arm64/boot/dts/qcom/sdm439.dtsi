@@ -175,7 +175,7 @@
 &mdss_dsi0_phy {
 	compatible = "qcom,dsi-phy-12nm";
 
-	reg = <0x01a94400 0x300>,
+	reg = <0x01a94400 0x400>,
 	      <0x01a94400 0x400>,
 	      <0x0193e000 0x30>;
 
@@ -187,7 +187,7 @@
 &mdss_dsi1_phy {
 	compatible = "qcom,dsi-phy-12nm";
 
-	reg = <0x1a96400 0x300>,
+	reg = <0x1a96400 0x400>,
 	      <0x1a96400 0x400>,
 	      <0x0193e000 0x30>;
 
