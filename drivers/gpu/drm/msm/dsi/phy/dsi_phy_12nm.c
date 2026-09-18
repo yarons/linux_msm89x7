@@ -1399,9 +1399,11 @@ static const struct regulator_bulk_data dsi_phy_12nm_regulators[] = {
 };
 
 /*
- * There is nothing to do for the PHY regulator block on this PHY
- * (mdss_dsi_12nm_phy_regulator_enable() is empty), so has_phy_regulator is not
- * set although the DT node lists a "dsi_phy_regulator" region.
+ * This PHY has no regulator block (mdss_dsi_12nm_phy_regulator_enable() is
+ * empty), so has_phy_regulator is not set. The "dsi_phy_regulator" region that
+ * sdm439.dtsi lists for it is not a regulator either: 0x193e000 is the MMSS
+ * misc block with the DSI ULPS clamp and PHY reset controls ("mmss_misc_phys"
+ * in the vendor DT), which the msm DSI driver does not use. It is ignored.
  */
 const struct msm_dsi_phy_cfg dsi_phy_12nm_cfgs = {
 	.regulator_data = dsi_phy_12nm_regulators,
