@@ -12,6 +12,7 @@
 #include "sdm429.dtsi"
 #include "pm8953.dtsi"
 #include "pmi632.dtsi"
+#include "msm8937-qdsp6.dtsi"
 
 / {
 	model = "Samsung Galaxy Tab A 8.0 (2019)";
@@ -45,6 +46,32 @@
 				 <&gcc GCC_MDSS_ESC0_CLK>;
 			power-domains = <&gcc MDSS_GDSC>;
 		};
+	};
+
+	/*
+	 * The codec HPH outputs feed both the two speaker amplifiers and the
+	 * headphone jack. The vendor kernel opens the way to the jack with a
+	 * "headset amp" mixer control that drives two GPIOs high together
+	 * (qcom,hph-en-gpio = TLMM 41, qcom,hph-in-gpio = TLMM 48) and low
+	 * again when the headphones path is closed. The part behind them is
+	 * not known, so they are described as two enables in series.
+	 */
+	headphones_amp: audio-amplifier-headphones {
+		compatible = "simple-audio-amplifier";
+		enable-gpios = <&tlmm 41 GPIO_ACTIVE_HIGH>;
+		sound-name-prefix = "Headphones Amp";
+
+		pinctrl-0 = <&headphones_amp_default>;
+		pinctrl-names = "default";
+	};
+
+	headphones_switch: audio-switch-headphones {
+		compatible = "simple-audio-amplifier";
+		enable-gpios = <&tlmm 48 GPIO_ACTIVE_HIGH>;
+		sound-name-prefix = "Headphones Switch";
+
+		pinctrl-0 = <&headphones_switch_default>;
+		pinctrl-names = "default";
 	};
 
 	usb_vbus: extcon-usb-dummy {
@@ -108,6 +135,19 @@
 	};
 };
 
+&adsp {
+	status = "okay";
+};
+
+/* 0x1100000 by default, the size of the vendor adsp_fw_mem region */
+&adsp_mem {
+	status = "okay";
+};
+
+&apr {
+	status = "okay";
+};
+
 &blsp1_i2c3 {
 	status = "okay";
 
@@ -126,6 +166,40 @@
 		touchscreen-size-x = <800>;
 		touchscreen-size-y = <1280>;
 	};
+};
+
+/* Vendor i2c_8, which it runs at 400 kHz */
+&blsp2_i2c4 {
+	status = "okay";
+
+	/*
+	 * The reset lines have to be high for the amplifiers to work and to
+	 * answer on I2C. The vendor driver drives them as raw values and
+	 * ignores the flag in its device tree.
+	 */
+	speaker_amp_left: audio-amplifier@58 {
+		compatible = "awinic,aw87319";
+		reg = <0x58>;
+		reset-gpios = <&tlmm 39 GPIO_ACTIVE_LOW>;
+		sound-name-prefix = "Speaker Amp Left";
+
+		pinctrl-0 = <&speaker_amp_left_default>;
+		pinctrl-names = "default";
+	};
+
+	speaker_amp_right: audio-amplifier@59 {
+		compatible = "awinic,aw87319";
+		reg = <0x59>;
+		reset-gpios = <&tlmm 40 GPIO_ACTIVE_LOW>;
+		sound-name-prefix = "Speaker Amp Right";
+
+		pinctrl-0 = <&speaker_amp_right_default>;
+		pinctrl-names = "default";
+	};
+};
+
+&lpass_codec {
+	status = "okay";
 };
 
 &pm8953_gpios {
@@ -310,9 +384,59 @@
 	clock-frequency = <32768>;
 };
 
+&sound {
+	model = "samsung-gtowifi";
+
+	aux-devs = <&speaker_amp_left>, <&speaker_amp_right>,
+		   <&headphones_amp>, <&headphones_switch>;
+	widgets = "Speaker", "Speaker",
+		  "Headphone", "Headphones";
+	pin-switches = "Speaker", "Headphones";
+	audio-routing = "Speaker", "Speaker Amp Left OUT",
+			"Speaker", "Speaker Amp Right OUT",
+			"Speaker Amp Left IN", "HPH_L",
+			"Speaker Amp Right IN", "HPH_R",
+			"Headphones", "Headphones Switch OUTL",
+			"Headphones", "Headphones Switch OUTR",
+			"Headphones Switch INL", "Headphones Amp OUTL",
+			"Headphones Switch INR", "Headphones Amp OUTR",
+			"Headphones Amp INL", "HPH_L",
+			"Headphones Amp INR", "HPH_R",
+			"AMIC1", "MIC BIAS External1",
+			"AMIC2", "MIC BIAS Internal2",
+			"AMIC3", "MIC BIAS External1",
+			"MM_DL1", "MultiMedia1 Playback",
+			"MM_DL3", "MultiMedia3 Playback",
+			"MM_DL4", "MultiMedia4 Playback",
+			"MultiMedia2 Capture", "MM_UL2";
+
+	status = "okay";
+
+	/* Wi-Fi only: no modem, no voice calls */
+	/delete-node/ voicemmode1-dai-link;
+};
+
 &tlmm {
 	/* Owned by TZ: the vendor kernel refuses to touch these */
 	gpio-reserved-ranges = <0 4>;
+
+	/*
+	 * The vendor kernel leaves the four audio enable lines at their
+	 * pull-down, which keeps the amplifiers off while nothing drives them.
+	 */
+	headphones_amp_default: headphones-amp-default-state {
+		pins = "gpio41";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	headphones_switch_default: headphones-switch-default-state {
+		pins = "gpio48";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
 
 	keys_default: keys-default-state {
 		pins = "gpio91";
@@ -326,6 +450,20 @@
 		function = "gpio";
 		drive-strength = <2>;
 		bias-disable;
+	};
+
+	speaker_amp_left_default: speaker-amp-left-default-state {
+		pins = "gpio39";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	speaker_amp_right_default: speaker-amp-right-default-state {
+		pins = "gpio40";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
 	};
 
 	ts_int_default: ts-int-default-state {
@@ -353,6 +491,26 @@
 	vdd-supply = <&pm8953_l23>;
 	vdda1p8-supply = <&pm8953_l7>;
 	vdda3p3-supply = <&pm8953_l13>;
+
+	status = "okay";
+};
+
+/*
+ * Vendor: qcom,msm-micbias1-ext-cap, qcom,msm-mbhc-hphl-swh = <1> (normally
+ * open), qcom,msm-mbhc-gnd-swh = <0> (normally closed) and the Wingtech
+ * button thresholds of def_msm8952_wcd_mbhc_cal(), the same for the
+ * current source and for micbias. The US/EURO switch (TLMM 63, which the
+ * vendor kernel drives low) has no mainline support and is left alone.
+ */
+&wcd_codec {
+	qcom,micbias1-ext-cap;
+	qcom,hphl-jack-type-normally-open;
+	qcom,mbhc-vthreshold-low = <75 225 450 500 500>;
+	qcom,mbhc-vthreshold-high = <75 225 450 500 500>;
+
+	vdd-cdc-io-supply = <&pm8953_l5>;
+	vdd-cdc-tx-rx-cx-supply = <&pm8953_s4>;
+	vdd-micbias-supply = <&pm8953_l13>;
 
 	status = "okay";
 };
