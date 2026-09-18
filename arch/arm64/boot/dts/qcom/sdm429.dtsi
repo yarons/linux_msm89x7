@@ -142,6 +142,11 @@
 	};
 };
 
+&gpu {
+	/* Adreno 504: a cut-down A505, the vendor kernel reports chip id 0x05000400 */
+	compatible = "qcom,adreno-504.0", "qcom,adreno";
+};
+
 &thermal_zones {
 	/delete-node/ cpuss0-thermal;
 };

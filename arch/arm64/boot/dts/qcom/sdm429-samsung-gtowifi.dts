@@ -128,6 +128,10 @@
 	};
 };
 
+&gpu {
+	status = "okay";
+};
+
 &pm8953_gpios {
 	/* GPIO3 and GPIO6 are disallowed by the vendor tree */
 	gpio-reserved-ranges = <2 1>, <5 1>;
