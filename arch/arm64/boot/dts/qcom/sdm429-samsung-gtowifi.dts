@@ -245,6 +245,10 @@
 	};
 };
 
+&gpu {
+	status = "okay";
+};
+
 &lpass_codec {
 	status = "okay";
 };
