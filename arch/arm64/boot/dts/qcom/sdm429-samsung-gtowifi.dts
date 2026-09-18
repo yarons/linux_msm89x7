@@ -229,9 +229,14 @@
 			regulator-always-on;
 		};
 
+		/*
+		 * SD card supply: the vendor kernel runs it at a fixed 2.95 V.
+		 * A wider range makes the MMC core ask L12 (I/O, capped at
+		 * 3.1 V by the vendor) for 3.3 V.
+		 */
 		pm8953_l11: l11 {
-			regulator-min-microvolt = <2700000>;
-			regulator-max-microvolt = <3300000>;
+			regulator-min-microvolt = <2950000>;
+			regulator-max-microvolt = <2950000>;
 		};
 
 		pm8953_l12: l12 {
