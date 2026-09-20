@@ -364,6 +364,46 @@ static const struct camss_subdev_resources csiphy_res_8x37[] = {
 	}
 };
 
+/*
+ * SDM429 and SDM439 are MSM8937 with another CSI-2 receiver PHY. The vendor
+ * software always runs its timer clock at 200 MHz.
+ */
+static const struct camss_subdev_resources csiphy_res_sdm439[] = {
+	/* CSIPHY0 */
+	{
+		.regulators = {},
+		.clock = { "top_ahb", "ispif_ahb", "ahb", "csiphy0_timer" },
+		.clock_rate = { { 0 },
+				{ 0 },
+				{ 0 },
+				{ 200000000 } },
+		.reg = { "csiphy0", "csiphy0_clk_mux" },
+		.interrupt = { "csiphy0" },
+		.csiphy = {
+			.id = 0,
+			.hw_ops = &csiphy_ops_snps_10_0,
+			.formats = &csiphy_formats_8x96
+		}
+	},
+
+	/* CSIPHY1 */
+	{
+		.regulators = {},
+		.clock = { "top_ahb", "ispif_ahb", "ahb", "csiphy1_timer" },
+		.clock_rate = { { 0 },
+				{ 0 },
+				{ 0 },
+				{ 200000000 } },
+		.reg = { "csiphy1", "csiphy1_clk_mux" },
+		.interrupt = { "csiphy1" },
+		.csiphy = {
+			.id = 1,
+			.hw_ops = &csiphy_ops_snps_10_0,
+			.formats = &csiphy_formats_8x96
+		}
+	}
+};
+
 static const struct camss_subdev_resources csid_res_8x37[] = {
 	/* CSID0 */
 	{
@@ -5444,6 +5484,18 @@ static const struct camss_resources msm8937_resources = {
 	.vfe_num = ARRAY_SIZE(vfe_res_8x37),
 };
 
+/* Everything but the CSIPHYs is the MSM8937 hardware, version included */
+static const struct camss_resources sdm439_resources = {
+	.version = CAMSS_8x37,
+	.csiphy_res = csiphy_res_sdm439,
+	.csid_res = csid_res_8x37,
+	.ispif_res = &ispif_res_8x17,
+	.vfe_res = vfe_res_8x37,
+	.csiphy_num = ARRAY_SIZE(csiphy_res_sdm439),
+	.csid_num = ARRAY_SIZE(csid_res_8x37),
+	.vfe_num = ARRAY_SIZE(vfe_res_8x37),
+};
+
 static const struct camss_resources msm8939_resources = {
 	.version = CAMSS_8x39,
 	.csiphy_res = csiphy_res_8x39,
@@ -5658,6 +5710,7 @@ static const struct of_device_id camss_dt_match[] = {
 	{ .compatible = "qcom,sa8775p-camss", .data = &sa8775p_resources },
 	{ .compatible = "qcom,sc7280-camss", .data = &sc7280_resources },
 	{ .compatible = "qcom,sc8280xp-camss", .data = &sc8280xp_resources },
+	{ .compatible = "qcom,sdm439-camss", .data = &sdm439_resources },
 	{ .compatible = "qcom,sdm660-camss", .data = &sdm660_resources },
 	{ .compatible = "qcom,sdm670-camss", .data = &sdm670_resources },
 	{ .compatible = "qcom,sdm845-camss", .data = &sdm845_resources },
