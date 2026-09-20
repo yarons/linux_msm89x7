@@ -377,7 +377,15 @@ static int csiphy_lanes_enable(struct csiphy_device *csiphy,
 	if (aggregate)
 		csiphy_snps_phy_config(csiphy, true, band);
 
-	csiphy_snps_irq_mask(csiphy, 0xff);
+	/*
+	 * The vendor driver unmasks every PHY interrupt here although it has
+	 * no use for them beyond a debug print. Do not: with a sensor on the
+	 * bus the clock lane status bit 0x40 fires about 180000 times a
+	 * second (GC2375H on a Samsung SM-T290), the handler eats CPU 0 and
+	 * no frame arrives. Nothing depends on these interrupts, the bit
+	 * meanings are not known.
+	 */
+	csiphy_snps_irq_mask(csiphy, 0x0);
 
 	val = CSIPHY_SNPS_A_FORCE_MODE;
 	if (aggregate)
