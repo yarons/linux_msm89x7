@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/i2c/galaxycore,gc8034.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: GalaxyCore GC8034 1/4" 8M Pixel MIPI CSI-2 sensor
+
+maintainers:
+  - Yaron Shahrabani <yarons@users.noreply.github.com>
+
+description:
+  The GC8034 is a raw image sensor with a 3264x2448 pixel array, a MIPI
+  CSI-2 image data interface with up to four data lanes and an I2C
+  compatible control bus. The output format is 10 bit raw Bayer.
+
+allOf:
+  - $ref: /schemas/media/video-interface-devices.yaml#
+
+properties:
+  compatible:
+    const: galaxycore,gc8034
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  dovdd-supply:
+    description: Digital I/O supply (IOVDD), 1.8 V.
+
+  avdd-supply:
+    description: Analog supply (AVDD), 2.8 V.
+
+  dvdd-supply:
+    description: Digital core supply (DVDD), 1.2 V.
+
+  vaf-supply:
+    description:
+      Supply of the voice coil driver of the camera module. The voice coil
+      driver shares the I2C bus with the sensor, the supply is kept on
+      together with the sensor supplies.
+
+  reset-gpios:
+    description: Reference to the GPIO connected to the RESETB pin.
+    maxItems: 1
+
+  powerdown-gpios:
+    description:
+      Reference to the GPIO connected to the PWDNB pin. The sensor is in
+      power down mode while the pin is low.
+    maxItems: 1
+
+  port:
+    $ref: /schemas/graph.yaml#/$defs/port-base
+    additionalProperties: false
+    description:
+      Output port node, single endpoint describing the CSI-2 transmitter.
+
+    properties:
+      endpoint:
+        $ref: /schemas/media/video-interfaces.yaml#
+        unevaluatedProperties: false
+
+        properties:
+          data-lanes:
+            items:
+              - const: 1
+              - const: 2
+              - const: 3
+              - const: 4
+
+          link-frequencies: true
+
+        required:
+          - data-lanes
+          - link-frequencies
+
+    required:
+      - endpoint
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - dovdd-supply
+  - avdd-supply
+  - dvdd-supply
+  - reset-gpios
+  - port
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        sensor@37 {
+            compatible = "galaxycore,gc8034";
+            reg = <0x37>;
+
+            clocks = <&gc8034_clk>;
+
+            reset-gpios = <&tlmm 36 GPIO_ACTIVE_LOW>;
+            powerdown-gpios = <&tlmm 20 GPIO_ACTIVE_LOW>;
+
+            avdd-supply = <&gc8034_avdd>;
+            dovdd-supply = <&gc8034_dovdd>;
+            dvdd-supply = <&gc8034_dvdd>;
+
+            orientation = <1>;
+            rotation = <90>;
+
+            port {
+                sensor_out: endpoint {
+                    data-lanes = <1 2 3 4>;
+                    link-frequencies = /bits/ 64 <336000000 168000000>;
+                    remote-endpoint = <&csiphy0_ep>;
+                };
+            };
+        };
+    };
+
+...
