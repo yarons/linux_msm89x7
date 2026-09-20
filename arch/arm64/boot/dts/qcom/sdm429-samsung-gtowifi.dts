@@ -255,7 +255,7 @@
 			reg = <0>;
 
 			csiphy0_ep: endpoint {
-				clock-lanes = <7>;
+				clock-lanes = <4>;
 				data-lanes = <0 1 2 3>;
 				remote-endpoint = <&rear_cam_ep>;
 			};
@@ -265,7 +265,7 @@
 			reg = <1>;
 
 			csiphy1_ep: endpoint {
-				clock-lanes = <7>;
+				clock-lanes = <4>;
 				data-lanes = <0>;
 				remote-endpoint = <&front_cam_ep>;
 			};
@@ -336,7 +336,7 @@
 		port {
 			front_cam_ep: endpoint {
 				data-lanes = <1>;
-				link-frequencies = /bits/ 64 <364800000>;
+				link-frequencies = /bits/ 64 <300000000>;
 				remote-endpoint = <&csiphy1_ep>;
 			};
 		};
