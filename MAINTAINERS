@@ -10694,6 +10694,7 @@ M:	Yaron Shahrabani <yarons@users.noreply.github.com>
 L:	linux-media@vger.kernel.org
 S:	Maintained
 F:	Documentation/devicetree/bindings/media/i2c/galaxycore,gc8034.yaml
+F:	drivers/media/i2c/gc8034.c
 
 GATEWORKS SYSTEM CONTROLLER (GSC) DRIVER
 M:	Tim Harvey <tharvey@gateworks.com>
