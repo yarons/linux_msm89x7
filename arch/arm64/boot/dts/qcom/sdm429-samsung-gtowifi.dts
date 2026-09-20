@@ -9,6 +9,7 @@
 /dts-v1/;
 #include <dt-bindings/arm/qcom,ids.h>
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
 #include "sdm429.dtsi"
 #include "pm8953.dtsi"
 #include "pmi632.dtsi"
@@ -46,6 +47,24 @@
 				 <&gcc GCC_MDSS_ESC0_CLK>;
 			power-domains = <&gcc MDSS_GDSC>;
 		};
+	};
+
+	/*
+	 * Vendor: bl_ctrl_pwm on the PM8953 PWM, 50 us period (20 kHz), out on
+	 * PM8953 GPIO8, enable on PM8953 GPIO4. The boot loader leaves the PWM
+	 * at 286 of 511.
+	 */
+	backlight: backlight {
+		compatible = "pwm-backlight";
+		pwms = <&pm8953_pwm 0 50000>;
+		enable-gpios = <&pm8953_gpios 4 GPIO_ACTIVE_HIGH>;
+
+		brightness-levels = <0 255>;
+		num-interpolated-steps = <255>;
+		default-brightness-level = <143>;
+
+		pinctrl-0 = <&backlight_pwm_default>, <&backlight_en_default>;
+		pinctrl-names = "default";
 	};
 
 	/*
@@ -385,10 +404,9 @@
 		/*
 		 * The panel bias (vendor "lab"/"ibb", 5.5 V from the PMI632
 		 * LCDB block) has no driver here and is left as the bootloader
-		 * set it up. The same goes for the backlight: there is
-		 * deliberately no backlight property, so that nothing can turn
-		 * off what the bootloader left on.
+		 * set it up.
 		 */
+		backlight = <&backlight>;
 		reset-gpios = <&tlmm 60 GPIO_ACTIVE_LOW>;
 
 		pinctrl-0 = <&panel_default>;
@@ -417,6 +435,27 @@
 &pm8953_gpios {
 	/* GPIO3 and GPIO6 are disallowed by the vendor tree */
 	gpio-reserved-ranges = <2 1>, <5 1>;
+
+	backlight_en_default: backlight-en-default-state {
+		pins = "gpio4";
+		function = PMIC_GPIO_FUNC_NORMAL;
+		power-source = <0>;
+		bias-disable;
+		output-high;
+	};
+
+	/* No vendor pinctrl entry: read from the registers the boot loader left */
+	backlight_pwm_default: backlight-pwm-default-state {
+		pins = "gpio8";
+		function = PMIC_GPIO_FUNC_DTEST2;
+		power-source = <0>;
+		bias-disable;
+		output-low;
+	};
+};
+
+&pm8953_pwm {
+	status = "okay";
 };
 
 &pm8953_resin {
