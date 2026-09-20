@@ -585,7 +585,7 @@ static int smb_get_prop_status(struct smb_chip *chip, int *val)
 		return rc;
 	}
 
-	if (stat[1] & CHARGER_ERROR_STATUS_BAT_OV_BIT) {
+	if (stat[1] & chip->var->ov_bit) {
 		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
 		return 0;
 	}
