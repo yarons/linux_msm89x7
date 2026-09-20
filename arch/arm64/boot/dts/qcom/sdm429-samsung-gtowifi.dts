@@ -49,6 +49,54 @@
 	};
 
 	/*
+	 * Wingtech p81081 pack, 4980 mAh, 4.4 V. The vendor device tree carries
+	 * three profiles (Scud 30 kOhm, Sunwoda 68 kOhm, Jiade 100 kOhm ID
+	 * resistor) whose charge limits and 25 degC OCV tables are identical, so
+	 * one node describes all of them and no qcom,batt-id-ohm check is made.
+	 *
+	 * The JEITA thresholds are raw BAT_THERM comparator codes. The vendor
+	 * profile only gives the hard pair (0x58ce 0x1815 = 0 and 55 degC); a
+	 * 100 kOhm / beta 4250 thermistor on the 100 kOhm pull-up with a full
+	 * scale of 28880 reproduces both within 0.1 percent, the other codes
+	 * come from that model. The vendor kernel charges at 0.5 A below
+	 * 10 degC and, in software, at 0.8 A to only 4.1 V between 45 and
+	 * 55 degC. The charger driver cannot lower the float voltage in the
+	 * warm zone, so charging stops at 45 degC instead and the 0.8 A zone
+	 * starts at 40 degC.
+	 */
+	battery: battery {
+		compatible = "simple-battery";
+		device-chemistry = "lithium-ion-polymer";
+		voltage-min-design-microvolt = <3400000>;
+		voltage-max-design-microvolt = <4400000>;
+		charge-full-design-microamp-hours = <4980000>;
+		constant-charge-current-max-microamp = <1500000>;
+		constant-charge-voltage-max-microvolt = <4400000>;
+
+		qcom,jeita-hard-thresholds = <0x58ce 0x20b3>;
+		qcom,jeita-soft-thresholds = <0x4cbf 0x25dd>;
+		qcom,jeita-soft-fcc-microamp = <500000 800000>;
+
+		/* qcom,pc-temp-v1-lut of the vendor QG profile, 25 degC column */
+		ocv-capacity-celsius = <25>;
+		ocv-capacity-table-0 =
+			<4380500 100>, <4358400 98>, <4334400 96>, <4309700 94>,
+			<4285300 92>, <4261400 90>, <4237900 88>, <4214700 86>,
+			<4191900 84>, <4169300 82>, <4146900 80>, <4125300 78>,
+			<4105300 76>, <4086100 74>, <4065400 72>, <4043300 70>,
+			<4022800 68>, <4005100 66>, <3988800 64>, <3973600 62>,
+			<3959800 60>, <3942500 58>, <3915800 56>, <3890300 54>,
+			<3875900 52>, <3865500 50>, <3857000 48>, <3849900 46>,
+			<3843300 44>, <3836300 42>, <3829700 40>, <3823700 38>,
+			<3818400 36>, <3813500 34>, <3809300 32>, <3805400 30>,
+			<3801300 28>, <3797400 26>, <3792100 24>, <3783200 22>,
+			<3772100 20>, <3760600 18>, <3747700 16>, <3731800 14>,
+			<3717200 12>, <3708100 10>, <3706000 9>, <3704000 8>,
+			<3702300 7>, <3697700 6>, <3673000 5>, <3629900 4>,
+			<3572900 3>, <3495000 2>, <3374300 1>, <3000000 0>;
+	};
+
+	/*
 	 * The codec HPH outputs feed both the two speaker amplifiers and the
 	 * headphone jack. The vendor kernel opens the way to the jack with a
 	 * "headset amp" mixer control that drives two GPIOs high together
@@ -209,6 +257,15 @@
 
 &pm8953_resin {
 	linux,code = <KEY_VOLUMEDOWN>;
+
+	status = "okay";
+};
+
+&pmi632_charger {
+	monitored-battery = <&battery>;
+
+	/* The vendor table starts above its own 1.5 A limit, begin there */
+	qcom,thermal-mitigation = <1500000 1000000 500000>;
 
 	status = "okay";
 };
