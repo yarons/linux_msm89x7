@@ -10687,6 +10687,7 @@ M:	Yaron Shahrabani <yarons@users.noreply.github.com>
 L:	linux-media@vger.kernel.org
 S:	Maintained
 F:	Documentation/devicetree/bindings/media/i2c/galaxycore,gc2375h.yaml
+F:	drivers/media/i2c/gc2375h.c
 
 GALAXYCORE GC5035 SENSOR DRIVER
 M:	Tomasz Figa <tfiga@chromium.org>
