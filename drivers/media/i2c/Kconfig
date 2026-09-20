@@ -974,6 +974,12 @@ endif
 menu "Flash devices"
 	visible if MEDIA_CAMERA_SUPPORT
 
+config VIDEO_GT9772
+	tristate "Giantec GT9772 lens voice coil support"
+	help
+	  This is a driver for the Giantec GT9772 camera lens voice coil
+	  driver, a 10 bit DAC with ringing control, controlled via I2C.
+
 config VIDEO_ADP1653
 	tristate "ADP1653 flash support"
 	depends on I2C && VIDEO_DEV
