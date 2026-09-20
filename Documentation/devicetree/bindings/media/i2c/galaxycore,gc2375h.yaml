@@ -67,8 +67,10 @@ properties:
 
           link-frequencies:
             description:
-              364800000 Hz with a 19.2 MHz master clock, 312000000 Hz with a
-              24 MHz master clock.
+              With a 19.2 MHz master clock 300000000 Hz, the rate the vendor
+              software sets its receiver up for, or 364800000 Hz, the rate
+              computed from the PLL settings. With a 24 MHz master clock
+              312000000 Hz.
 
         required:
           - data-lanes
@@ -114,7 +116,7 @@ examples:
             port {
                 endpoint {
                     data-lanes = <1>;
-                    link-frequencies = /bits/ 64 <364800000>;
+                    link-frequencies = /bits/ 64 <300000000>;
                     remote-endpoint = <&csiphy1_ep>;
                 };
             };
