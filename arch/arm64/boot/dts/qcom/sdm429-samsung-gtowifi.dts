@@ -309,7 +309,8 @@
 		pinctrl-names = "default";
 
 		orientation = <1>;
-		rotation = <90>;
+		/* Vendor mount angle 90 is clockwise, this property is counter-clockwise */
+		rotation = <270>;
 
 		port {
 			rear_cam_ep: endpoint {
@@ -341,7 +342,8 @@
 		pinctrl-names = "default";
 
 		orientation = <0>;
-		rotation = <270>;
+		/* Vendor mount angle 270, clockwise */
+		rotation = <90>;
 
 		port {
 			front_cam_ep: endpoint {
