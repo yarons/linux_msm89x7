@@ -140,10 +140,6 @@
 		pinctrl-names = "default";
 	};
 
-	usb_vbus: extcon-usb-dummy {
-		compatible = "linux,extcon-usb-dummy";
-	};
-
 	gpio-keys {
 		compatible = "gpio-keys";
 
@@ -522,6 +518,18 @@
 	status = "okay";
 };
 
+&pmi632_uusb {
+	status = "okay";
+};
+
+/* Boost converter for VBUS in host mode; vendor qcom,otg-cl-ua = 1 A */
+&pmi632_vbus {
+	regulator-min-microamp = <500000>;
+	regulator-max-microamp = <1000000>;
+
+	status = "okay";
+};
+
 &rpm_requests {
 	regulators {
 		compatible = "qcom,rpm-pm8953-regulators";
@@ -856,12 +864,16 @@
 };
 
 &usb {
-	extcon = <&usb_vbus>;
+	/* micro-USB: ID pin through the PMI632, no separate VBUS detection */
+	extcon = <&pmi632_uusb>, <&pmi632_uusb>;
+	vbus-supply = <&pmi632_vbus>;
 
 	status = "okay";
 };
 
 &usb_hs_phy {
+	extcon = <&pmi632_uusb>;
+
 	vdd-supply = <&pm8953_l23>;
 	vdda1p8-supply = <&pm8953_l7>;
 	vdda3p3-supply = <&pm8953_l13>;
