@@ -127,6 +127,11 @@
 	iommus = <&adreno_smmu 0>;
 };
 
+/* The CSI-2 receivers are Synopsys D-PHY pairs, not the MSM8937 CSIPHY */
+&camss {
+	compatible = "qcom,sdm439-camss";
+};
+
 &gcc {
 	compatible = "qcom,gcc-sdm439";
 };
