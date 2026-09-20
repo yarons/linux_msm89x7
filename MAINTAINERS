@@ -10682,6 +10682,12 @@ T:	git git://linuxtv.org/media.git
 F:	Documentation/devicetree/bindings/media/i2c/galaxycore,gc2145.yaml
 F:	drivers/media/i2c/gc2145.c
 
+GALAXYCORE GC2375H SENSOR DRIVER
+M:	Yaron Shahrabani <yarons@users.noreply.github.com>
+L:	linux-media@vger.kernel.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/media/i2c/galaxycore,gc2375h.yaml
+
 GALAXYCORE GC5035 SENSOR DRIVER
 M:	Tomasz Figa <tfiga@chromium.org>
 L:	linux-media@vger.kernel.org
