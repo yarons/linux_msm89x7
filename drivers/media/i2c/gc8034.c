@@ -86,6 +86,12 @@
  * All modes read the same 2464 sensor rows, line length and frame length are
  * counted in periods of the (unbinned) pixel clock. The frame length is
  * window height + 20 + the vertical blanking register.
+ *
+ * The PLL registers are not documented. 320 MHz is what the vendor library
+ * declares, and what line length, frame length and the 30 frames per second
+ * of both the vendor library and the Rockchip driver amount to (4272 * 2496 *
+ * 30 = 319.9 MHz). The 288 MHz of the Rockchip driver's pixel rate control
+ * does not fit its own mode.
  */
 #define GC8034_HTS			4272
 #define GC8034_VTS_OFFSET		2484
