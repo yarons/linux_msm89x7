@@ -11,6 +11,7 @@
  * Copyright (C) 2026 Yaron Shahrabani
  */
 #include <linux/array_size.h>
+#include <linux/bitops.h>
 #include <linux/bits.h>
 #include <linux/clk.h>
 #include <linux/container_of.h>
@@ -95,8 +96,12 @@
 #define GC2375H_MBUS_CODE		MEDIA_BUS_FMT_SRGGB10_1X10
 #define GC2375H_DATA_LANES		1
 
-/* Assumed, see struct gc2375h_clk_cfg */
+/*
+ * No source gives the PLL to MIPI ratio, see struct gc2375h_clk_cfg. The
+ * endpoint picks one of the values that go with the master clock in use.
+ */
 static const s64 gc2375h_link_freq_menu[] = {
+	300000000,
 	364800000,
 	312000000,
 };
@@ -114,13 +119,23 @@ static const struct {
 /*
  * The PLL multiplies the master clock by the multiplier register + 1 and a
  * quarter of that is the pixel clock: both register sets give the 30 frames
- * per second their sources state with it. The MIPI bit rate is an assumption,
- * twice the PLL output is the lowest rate that carries a line within the line
- * time. The vendor software declares 1200 Mbit/s to its receiver instead.
+ * per second their sources state with it.
+ *
+ * The MIPI bit rate at 19.2 MHz is one of two values:
+ *  - 600 Mbit/s (300 MHz) is what the vendor software sets its receiver up
+ *    for: the sensor library declares 1200 Mbit/s and the CSIPHY driver
+ *    counts a lone PHY as two lanes. The libraries of the other one lane
+ *    sensors of that software declare twice their lane rate the same way.
+ *  - 729.6 Mbit/s (364.8 MHz) is twice the PLL output, the lowest multiple
+ *    that carries a 1600 pixel line within the line time (691 Mbit/s needed).
+ *    The vendor library of the GC2375A, with the same PLL registers and
+ *    clock, states this value as its output pixel clock (72.96 MHz * 10).
+ * The first is the receiver setting known to work, the second more likely
+ * the truth. For 24 MHz only the computed value exists (624 Mbit/s).
  */
 struct gc2375h_clk_cfg {
 	unsigned long xclk_freq;
-	u32 link_freq_index;
+	unsigned long link_freq_mask;
 	u32 pixel_rate;
 	u32 hb;
 	u32 vb_def;
@@ -144,6 +159,7 @@ struct gc2375h {
 
 	struct regmap *regmap;
 	const struct gc2375h_clk_cfg *clk_cfg;
+	unsigned int link_freq_index;
 };
 
 /* Complete sensor setup for 1600x1200 and a 19.2 MHz master clock */
@@ -279,18 +295,18 @@ static const struct cci_reg_sequence gc2375h_24mhz_regs[] = {
 
 static const struct gc2375h_clk_cfg gc2375h_clk_cfgs[] = {
 	{
-		/* 19.2 MHz * 19: 91.2 MHz pixel clock, 729.6 Mbit/s */
+		/* 19.2 MHz * 19: 91.2 MHz pixel clock */
 		.xclk_freq = 19200000,
-		.link_freq_index = 0,
+		.link_freq_mask = BIT(0) | BIT(1),
 		.pixel_rate = 91200000,
 		.hb = 0x026a,
 		.vb_def = 0x00d6,
 		.exposure_def = 0x0510,
 	},
 	{
-		/* 24 MHz * 13: 78 MHz pixel clock, 624 Mbit/s */
+		/* 24 MHz * 13: 78 MHz pixel clock */
 		.xclk_freq = 24000000,
-		.link_freq_index = 1,
+		.link_freq_mask = BIT(2),
 		.pixel_rate = 78000000,
 		.hb = 0x025a,
 		.vb_def = 0x0010,
@@ -655,11 +671,15 @@ static int gc2375h_parse_fwnode(struct gc2375h *gc2375h)
 	if (ret)
 		goto done;
 
-	if (!(link_freq_bitmap & BIT(gc2375h->clk_cfg->link_freq_index)))
+	link_freq_bitmap &= gc2375h->clk_cfg->link_freq_mask;
+	if (!link_freq_bitmap) {
 		ret = dev_err_probe(dev, -EINVAL,
-				    "link frequency %lld Hz of a %lu Hz clock not in the endpoint\n",
-				    gc2375h_link_freq_menu[gc2375h->clk_cfg->link_freq_index],
+				    "no link frequency for a %lu Hz clock in the endpoint\n",
 				    gc2375h->clk_cfg->xclk_freq);
+		goto done;
+	}
+
+	gc2375h->link_freq_index = __ffs(link_freq_bitmap);
 
 done:
 	v4l2_fwnode_endpoint_free(&bus_cfg);
@@ -686,7 +706,7 @@ static int gc2375h_init_controls(struct gc2375h *gc2375h)
 	ctrl = v4l2_ctrl_new_int_menu(hdl, &gc2375h_ctrl_ops,
 				      V4L2_CID_LINK_FREQ,
 				      ARRAY_SIZE(gc2375h_link_freq_menu) - 1,
-				      cfg->link_freq_index,
+				      gc2375h->link_freq_index,
 				      gc2375h_link_freq_menu);
 	if (ctrl)
 		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
