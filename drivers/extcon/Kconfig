@@ -164,6 +164,16 @@ config EXTCON_PTN5150
 	  Say Y here to enable support for USB peripheral and USB host
 	  detection by NXP PTN5150 CC (Configuration Channel) logic chip.
 
+config EXTCON_QCOM_PMIC_UUSB
+	tristate "Qualcomm SMB5 PMIC micro-USB ID detection"
+	depends on ARCH_QCOM || COMPILE_TEST
+	depends on MFD_SPMI_PMIC || COMPILE_TEST
+	select REGMAP
+	help
+	  Say Y here to enable USB OTG adapter detection on boards with a
+	  micro-USB receptacle wired to the Type-C block of a Qualcomm PMIC
+	  with an SMB5 charger, such as PMI632, running in micro USB mode.
+
 config EXTCON_QCOM_SPMI_MISC
 	tristate "Qualcomm USB extcon support"
 	depends on ARCH_QCOM || COMPILE_TEST
