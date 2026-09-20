@@ -279,9 +279,19 @@
 
 &cci_i2c0 {
 	/* Rear camera module; its GT9772 voice coil driver sits at 0x0c */
+	rear_lens: lens@c {
+		compatible = "giantec,gt9772";
+		reg = <0x0c>;
+
+		/* Vendor cam_vaf */
+		vdd-supply = <&pm8953_l17>;
+	};
+
 	camera-sensor@37 {
 		compatible = "galaxycore,gc8034";
 		reg = <0x37>;
+
+		lens-focus = <&rear_lens>;
 
 		clocks = <&gcc GCC_CAMSS_MCLK0_CLK>;
 		assigned-clocks = <&gcc GCC_CAMSS_MCLK0_CLK>;
