@@ -142,6 +142,45 @@
 	};
 };
 
+/*
+ * SDM429 parts are speed binned (vendor fuse bits: 0xa6004[23:22] and
+ * 0xa6008[10:9]): 650, 560, 510 or 320 MHz maximum. The fuse is split
+ * over two words, which a single nvmem cell cannot describe, so only
+ * describe what is valid for every bin. The vendor clock driver maps
+ * everything up to 320 MHz to the lowest VDDCX corner it uses (SVS).
+ */
+/delete-node/ &gpu_opp_table;
+
+&gpu {
+	gpu_opp_table: opp-table {
+		compatible = "operating-points-v2";
+
+		opp-19200000 {
+			opp-hz = /bits/ 64 <19200000>;
+			required-opps = <&rpmpd_opp_min_svs>;
+			opp-supported-hw = <0xff>;
+		};
+
+		opp-216000000 {
+			opp-hz = /bits/ 64 <216000000>;
+			required-opps = <&rpmpd_opp_svs>;
+			opp-supported-hw = <0xff>;
+		};
+
+		opp-266670000 {
+			opp-hz = /bits/ 64 <266670000>;
+			required-opps = <&rpmpd_opp_svs>;
+			opp-supported-hw = <0xff>;
+		};
+
+		opp-320000000 {
+			opp-hz = /bits/ 64 <320000000>;
+			required-opps = <&rpmpd_opp_svs>;
+			opp-supported-hw = <0xff>;
+		};
+	};
+};
+
 &thermal_zones {
 	/delete-node/ cpuss0-thermal;
 };
