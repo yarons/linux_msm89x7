@@ -15,6 +15,19 @@
 #include "pmi632.dtsi"
 #include "msm8937-qdsp6.dtsi"
 
+/*
+ * SDM429 has the four cores at 0x100..0x103 only. The nodes of the other
+ * cluster describe cores that do not exist here: they fail to boot (-22) but
+ * stay "present", and because they have no idle states, cpuidle-psci (which
+ * wants idle states on every present CPU) does not register for any CPU.
+ * This belongs in sdm429.dtsi; kept here until the other SDM429 boards have
+ * been tested with it.
+ */
+/delete-node/ &cpu0;
+/delete-node/ &cpu1;
+/delete-node/ &cpu2;
+/delete-node/ &cpu3;
+
 / {
 	model = "Samsung Galaxy Tab A 8.0 (2019)";
 	compatible = "samsung,gtowifi", "qcom,sdm429";
@@ -22,6 +35,31 @@
 
 	qcom,msm-id = <QCOM_ID_SDM429 0>;
 	qcom,board-id = <QCOM_BOARD_ID_MTP 0>;
+
+	cpus {
+		cpu-map {
+			/delete-node/ cluster0;
+			/delete-node/ cluster1;
+
+			cluster0 {
+				core0 {
+					cpu = <&cpu4>;
+				};
+
+				core1 {
+					cpu = <&cpu5>;
+				};
+
+				core2 {
+					cpu = <&cpu6>;
+				};
+
+				core3 {
+					cpu = <&cpu7>;
+				};
+			};
+		};
+	};
 
 	chosen {
 		#address-cells = <2>;
