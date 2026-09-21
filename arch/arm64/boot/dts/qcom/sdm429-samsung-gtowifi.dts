@@ -140,8 +140,23 @@
 	};
 
 	reserved-memory {
-		/* Wi-Fi only: no modem, the vendor kernel keeps ramoops here */
+		/*
+		 * The vendor kernel keeps ramoops at the address msm8937.dtsi
+		 * uses for the modem's remote file system buffer, and allocates
+		 * that buffer dynamically. Do the same. The modem is needed on
+		 * this Wi-Fi only tablet too: it runs the GNSS engine.
+		 */
 		/delete-node/ rmtfs@92100000;
+
+		rmtfs {
+			compatible = "qcom,rmtfs-mem";
+			size = <0x0 0x180000>;
+			alignment = <0x0 0x100000>;
+			alloc-ranges = <0x0 0x86800000 0x0 0x8000000>;
+			no-map;
+
+			qcom,client-id = <1>;
+		};
 
 		/* Samsung sec_debug, written by the bootloader */
 		sec-debug@85000000 {
@@ -355,11 +370,19 @@
 	};
 };
 
+&gps_mem {
+	status = "okay";
+};
+
 &gpu {
 	status = "okay";
 };
 
 &lpass_codec {
+	status = "okay";
+};
+
+&mba_mem {
 	status = "okay";
 };
 
@@ -412,6 +435,24 @@
 &mdss_dsi0_phy {
 	/* 1.8 V "vddio" of the vendor qcom,phy-supply-entries */
 	vddio-supply = <&pm8953_l5>;
+
+	status = "okay";
+};
+
+&memshare {
+	status = "okay";
+};
+
+/* No cellular radio on this model, but the GNSS engine runs on the modem DSP */
+&modem {
+	pll-supply = <&pm8953_l7>;
+
+	status = "okay";
+};
+
+/* Vendor modem_region: same address and size */
+&mpss_mem {
+	reg = <0x0 0x86800000 0x0 0x5500000>;
 
 	status = "okay";
 };
