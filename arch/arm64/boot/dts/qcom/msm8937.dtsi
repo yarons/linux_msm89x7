@@ -250,6 +250,20 @@
 		};
 	};
 
+	master-stats {
+		compatible = "qcom,rpm-master-stats";
+		qcom,rpm-msg-ram = <&apss_master_stats>,
+				   <&mpss_master_stats>,
+				   <&pronto_master_stats>,
+				   <&tz_master_stats>,
+				   <&lpass_master_stats>;
+		qcom,master-names = "APSS",
+				    "MPSS",
+				    "PRONTO",
+				    "TZ",
+				    "LPASS";
+	};
+
 	memory@80000000 {
 		/* We expect the bootloader to fill in the reg */
 		reg = <0 0x80000000 0 0>;
@@ -750,6 +764,30 @@
 		rpm_msg_ram: sram@60000 {
 			compatible = "qcom,rpm-msg-ram";
 			reg = <0x00060000 0x8000>;
+
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges = <0 0x00060000 0x8000>;
+
+			apss_master_stats: sram@150 {
+				reg = <0x150 0x60>;
+			};
+
+			mpss_master_stats: sram@1150 {
+				reg = <0x1150 0x60>;
+			};
+
+			pronto_master_stats: sram@2150 {
+				reg = <0x2150 0x60>;
+			};
+
+			tz_master_stats: sram@3150 {
+				reg = <0x3150 0x60>;
+			};
+
+			lpass_master_stats: sram@4150 {
+				reg = <0x4150 0x60>;
+			};
 		};
 
 		usb_hs_phy: phy@6c000 {
@@ -774,6 +812,11 @@
 			reg = <0x000e3000 0x1000>;
 			clocks = <&gcc GCC_PRNG_AHB_CLK>;
 			clock-names = "core";
+		};
+
+		sram@290000 {
+			compatible = "qcom,rpm-stats";
+			reg = <0x00290000 0x10000>;
 		};
 
 		tsens: thermal-sensor@4a9000 {
