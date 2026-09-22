@@ -341,6 +341,35 @@
 	};
 };
 
+/*
+ * The vendor kernel has a third low power level above the cluster: "system
+ * power collapse" (mode 3 in bits [11:8] of the PSCI parameter, affinity
+ * level 2), the one with the RPM handshake in which the RPM can drop the
+ * application processor's votes and shut the XO down. Without it the SoC
+ * never sleeps deeper than the cluster power collapse. Entry and exit
+ * latency are the vendor's time-overhead and latency-us for that level.
+ */
+&cluster_pd {
+	power-domains = <&system_pd>;
+};
+
+&{/cpus/domain-idle-states} {
+	system_sleep_0: system-power-collapse {
+		compatible = "domain-idle-state";
+		arm,psci-suspend-param = <0x42000353>;
+		entry-latency-us = <1500>;
+		exit-latency-us = <10800>;
+		min-residency-us = <30000>;
+	};
+};
+
+&{/psci} {
+	system_pd: power-domain-system {
+		#power-domain-cells = <0>;
+		domain-idle-states = <&system_sleep_0>;
+	};
+};
+
 &cci {
 	status = "okay";
 };
