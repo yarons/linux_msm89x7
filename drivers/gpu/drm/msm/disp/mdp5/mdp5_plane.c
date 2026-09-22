@@ -329,6 +329,8 @@ static int mdp5_plane_atomic_check(struct drm_plane *plane,
 										 plane);
 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state,
 										 plane);
+	struct mdp5_plane_state *old_mdp5_state = to_mdp5_plane_state(old_plane_state);
+	struct mdp5_plane_state *new_mdp5_state = to_mdp5_plane_state(new_plane_state);
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *crtc_state;
 
@@ -339,6 +341,22 @@ static int mdp5_plane_atomic_check(struct drm_plane *plane,
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 	if (WARN_ON(!crtc_state))
 		return -EINVAL;
+
+	/*
+	 * The hardware pipes are owned through the global state, which
+	 * drm_atomic_helper_duplicate_state() does not snapshot. A plane
+	 * state that was not duplicated from the current one (the snapshot
+	 * drm_atomic_helper_suspend() takes and drm_atomic_helper_resume()
+	 * commits) still names the pipes the plane had back then, which were
+	 * released when the planes were disabled. Start from what the plane
+	 * has now, so that the check assigns pipes through the global state
+	 * again instead of keeping ones it does not own.
+	 */
+	if (old_mdp5_state->hwpipe != new_mdp5_state->hwpipe ||
+	    old_mdp5_state->r_hwpipe != new_mdp5_state->r_hwpipe) {
+		new_mdp5_state->hwpipe = old_mdp5_state->hwpipe;
+		new_mdp5_state->r_hwpipe = old_mdp5_state->r_hwpipe;
+	}
 
 	return mdp5_plane_atomic_check_with_state(crtc_state, new_plane_state);
 }
