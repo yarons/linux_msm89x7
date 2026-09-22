@@ -366,6 +366,7 @@
 &{/psci} {
 	system_pd: power-domain-system {
 		#power-domain-cells = <0>;
+		power-domains = <&mpm>;
 		domain-idle-states = <&system_sleep_0>;
 	};
 };
