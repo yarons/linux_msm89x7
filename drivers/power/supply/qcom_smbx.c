@@ -534,6 +534,20 @@
 #define SMB_FG_LEARN_MIN_PCT				50
 #define SMB_FG_LEARN_MAX_PCT				110
 
+/*
+ * The end of the pack. The count carries the state of charge between rested
+ * readings, but nothing it counts sees the end coming: at the bottom of the
+ * curve the voltage falls away under load faster than the last percent of the
+ * count drains. Playing video at 0.8 to 1 A, a Galaxy Tab A 8.0 counted 7 % at
+ * 3.26 V, 4 % at 2.92 V and 3 % at 2.58 V, and a minute later the pack's own
+ * protection cut the power - so userspace, which shuts down cleanly only once
+ * the capacity reads zero, never got to. A pack that stays below its declared
+ * minimum voltage for this many polls of discharging is empty, whatever the
+ * count says. A minute rides out the dip of a burst of load; the collapse it
+ * guards against took a quarter of an hour.
+ */
+#define SMB_FG_EMPTY_POLLS				6
+
 #define SDP_CURRENT_UA					500000
 #define CDP_CURRENT_UA					1500000
 #define DCP_CURRENT_UA					1500000
@@ -749,6 +763,11 @@ struct smb_variant {
  * @fg_learn_soc:	State of charge at the last anchor, or -1 when there is
  *			no span in progress - which is also how a span that
  *			cannot be trusted is thrown away
+ * @fg_low_polls:	Consecutive polls that found the pack discharging below
+ *			its declared minimum voltage
+ * @fg_empty:		The pack stayed there long enough to be empty, see
+ *			smb_fg_check_empty(). Holds until the charger drives the
+ *			pack again
  */
 struct smb_chip {
 	struct device *dev;
@@ -790,6 +809,8 @@ struct smb_chip {
 	int charge_full_uah;
 	s64 fg_learn_ua_ms;
 	int fg_learn_soc;
+	int fg_low_polls;
+	bool fg_empty;
 };
 
 static enum power_supply_property smb_properties[] = {
@@ -1816,12 +1837,67 @@ static void smb_fg_sdam_restore_full(struct smb_chip *chip)
 		full);
 }
 
+/**
+ * smb_fg_check_empty() - notice the pack running out under the count
+ * @chip: the charger
+ *
+ * See SMB_FG_EMPTY_POLLS. The threshold is the battery's own declared minimum.
+ * It is compared against the open-circuit voltage recovered from the sample,
+ * which on a board that gives no internal resistance is the terminal voltage
+ * itself - that stops a heavily loaded pack a little early, which is the side
+ * to err on. Only the reported capacity goes to zero: the count is left as it
+ * is, since the capacity learning and the next boot's restore both work from
+ * it.
+ *
+ * Returns: true when the pack has just become empty, or stopped being so.
+ */
+static bool smb_fg_check_empty(struct smb_chip *chip)
+{
+	int min_uv = chip->batt_info->voltage_min_design_uv;
+	int v_uv, i_ua;
+	bool was;
+
+	if (min_uv <= 0)
+		return false;
+
+	if (smb_qg_read_sample(chip, QG_LAST_ADC_V_DATA0, &v_uv, &i_ua) < 0)
+		return false;
+
+	guard(mutex)(&chip->fg_lock);
+
+	was = chip->fg_empty;
+
+	if (chip->fg_charging) {
+		chip->fg_low_polls = 0;
+		chip->fg_empty = false;
+		return was;
+	}
+
+	if (i_ua < 0 && smb_batt_ocv(chip, v_uv, i_ua) < min_uv)
+		chip->fg_low_polls = min(chip->fg_low_polls + 1,
+					 SMB_FG_EMPTY_POLLS);
+	else
+		chip->fg_low_polls = 0;
+
+	if (chip->fg_low_polls >= SMB_FG_EMPTY_POLLS && !was) {
+		chip->fg_empty = true;
+		dev_info(chip->dev, "fg: empty at %duV, %duA, counted %d.%02d%%\n",
+			 v_uv, i_ua, chip->soc_permyriad / 100,
+			 chip->soc_permyriad % 100);
+	}
+
+	return chip->fg_empty != was;
+}
+
 static void smb_fg_work(struct work_struct *work)
 {
 	struct smb_chip *chip = container_of(work, struct smb_chip,
 					     fg_work.work);
+	bool changed = smb_fg_update(chip);
 
-	if (smb_fg_update(chip))
+	if (smb_fg_check_empty(chip))
+		changed = true;
+	if (changed)
 		power_supply_changed(chip->batt_psy);
 
 	smb_fg_sdam_store(chip);
@@ -2012,7 +2088,9 @@ static int smb_get_batt_capacity(struct smb_chip *chip, int *val)
 		if (!chip->fg_ready)
 			return -EAGAIN;
 
-		*val = DIV_ROUND_CLOSEST(chip->soc_permyriad, 100);
+		/* An empty pack reads empty whatever the count says */
+		*val = chip->fg_empty ? 0 :
+		       DIV_ROUND_CLOSEST(chip->soc_permyriad, 100);
 		return 0;
 	}
 
