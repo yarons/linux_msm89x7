@@ -419,11 +419,6 @@
 		method = "smc";
 		force-psci-domains;
 
-		cluster_pd: power-domain-cluster {
-			#power-domain-cells = <0>;
-			domain-idle-states = <&cluster_sleep_0>;
-		};
-
 		cpu_pd0: power-domain-cpu0 {
 			#power-domain-cells = <0>;
 			power-domains = <&cluster_pd>;
@@ -446,6 +441,11 @@
 			#power-domain-cells = <0>;
 			power-domains = <&cluster_pd>;
 			domain-idle-states = <&cpu_sleep_0>;
+		};
+
+		cluster_pd: power-domain-cluster {
+			#power-domain-cells = <0>;
+			domain-idle-states = <&cluster_sleep_0>;
 		};
 	};
 
