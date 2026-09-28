@@ -1474,8 +1474,7 @@ static int smb_init_cooling(struct smb_chip *chip)
 
 	chip->thermal_levels = count;
 
-	tcd = devm_thermal_of_cooling_device_register(chip->dev,
-						      dev_of_node(chip->dev),
+	tcd = devm_thermal_of_cooling_device_register(chip->dev, 0,
 						      "qcom-smbx-charger", chip,
 						      &smb_tcd_ops);
 	if (IS_ERR(tcd))
