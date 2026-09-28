@@ -323,28 +323,25 @@ static int ispif_reset(struct ispif_device *ispif, u8 vfe_id)
 	struct camss *camss = ispif->camss;
 	int ret;
 
-	ret = camss_pm_domain_on(camss, PM_DOMAIN_VFE0);
-	if (ret < 0)
+	ret = vfe_power_on(&camss->vfe[0]);
+	if (ret)
 		return ret;
 
-	ret = camss_pm_domain_on(camss, PM_DOMAIN_VFE1);
-	if (ret < 0)
-		return ret;
-
-	ret = camss_enable_clocks(ispif->nclocks_for_reset,
-				  ispif->clock_for_reset,
-				  camss->dev);
-	if (ret < 0)
-		return ret;
+	if (camss->res->vfe_num > 1) {
+		ret = vfe_power_on(&camss->vfe[1]);
+		if (ret)
+			goto vfe0_power_off;
+	}
 
 	ret = ispif_vfe_reset(ispif, vfe_id);
 	if (ret)
 		dev_dbg(camss->dev, "ISPIF Reset failed\n");
 
-	camss_disable_clocks(ispif->nclocks_for_reset, ispif->clock_for_reset);
+	if (camss->res->vfe_num > 1)
+		vfe_power_off(&camss->vfe[1]);
 
-	camss_pm_domain_off(camss, PM_DOMAIN_VFE0);
-	camss_pm_domain_off(camss, PM_DOMAIN_VFE1);
+vfe0_power_off:
+	vfe_power_off(&camss->vfe[0]);
 
 	return ret;
 }
@@ -1112,7 +1109,9 @@ int msm_ispif_subdev_init(struct camss *camss,
 	/* Number of ISPIF lines - same as number of CSID hardware modules */
 	if (camss->res->version == CAMSS_8x16)
 		ispif->line_num = 2;
-	else if (camss->res->version == CAMSS_8x39)
+	else if (camss->res->version == CAMSS_8x17 ||
+		 camss->res->version == CAMSS_8x37 ||
+		 camss->res->version == CAMSS_8x39)
 		ispif->line_num = 3;
 	else if (camss->res->version == CAMSS_8x96 ||
 		 camss->res->version == CAMSS_8x53 ||
@@ -1131,6 +1130,8 @@ int msm_ispif_subdev_init(struct camss *camss,
 		ispif->line[i].id = i;
 
 		if (camss->res->version == CAMSS_8x16 ||
+		    camss->res->version == CAMSS_8x17 ||
+		    camss->res->version == CAMSS_8x37 ||
 		    camss->res->version == CAMSS_8x39) {
 			ispif->line[i].formats = ispif_formats_8x16;
 			ispif->line[i].nformats =
@@ -1169,8 +1170,10 @@ int msm_ispif_subdev_init(struct camss *camss,
 	    camss->res->version == CAMSS_8x39)
 		ret = devm_request_irq(dev, ispif->irq, ispif_isr_8x16,
 			       IRQF_TRIGGER_RISING, ispif->irq_name, ispif);
-	else if (camss->res->version == CAMSS_8x96 ||
+	else if (camss->res->version == CAMSS_8x17 ||
+		 camss->res->version == CAMSS_8x37 ||
 		 camss->res->version == CAMSS_8x53 ||
+		 camss->res->version == CAMSS_8x96 ||
 		 camss->res->version == CAMSS_660)
 		ret = devm_request_irq(dev, ispif->irq, ispif_isr_8x96,
 			       IRQF_TRIGGER_RISING, ispif->irq_name, ispif);
@@ -1198,28 +1201,6 @@ int msm_ispif_subdev_init(struct camss *camss,
 		struct camss_clock *clock = &ispif->clock[i];
 
 		clock->clk = devm_clk_get(dev, res->clock[i]);
-		if (IS_ERR(clock->clk))
-			return PTR_ERR(clock->clk);
-
-		clock->freq = NULL;
-		clock->nfreqs = 0;
-	}
-
-	ispif->nclocks_for_reset = 0;
-	while (res->clock_for_reset[ispif->nclocks_for_reset])
-		ispif->nclocks_for_reset++;
-
-	ispif->clock_for_reset = devm_kcalloc(dev,
-					      ispif->nclocks_for_reset,
-					      sizeof(*ispif->clock_for_reset),
-					      GFP_KERNEL);
-	if (!ispif->clock_for_reset)
-		return -ENOMEM;
-
-	for (i = 0; i < ispif->nclocks_for_reset; i++) {
-		struct camss_clock *clock = &ispif->clock_for_reset[i];
-
-		clock->clk = devm_clk_get(dev, res->clock_for_reset[i]);
 		if (IS_ERR(clock->clk))
 			return PTR_ERR(clock->clk);
 

@@ -43,7 +43,24 @@
 		input-voltage-limit-microvolt = <4400000>;
 		input-current-limit-microamp = <1000000>;
 		monitored-battery = <&battery>;
+
+		// TODO: remove when power-supplies property is fixed
+		omit-battery-class;
 	};
+};
+
+&panel {
+	compatible = "xiaomi,riva-panel";
+};
+
+&sound {
+	model = "xiaomi-riva";
+};
+
+&speaker_amp {
+	awinic,mode = <3>;
+
+	status = "okay";
 };
 
 &tlmm {

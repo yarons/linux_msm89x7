@@ -409,6 +409,24 @@ static struct rpmpd mx_s2a_corner_ao = {
 	.key = KEY_CORNER,
 };
 
+static struct rpmpd mx_s2a_lvl_ao;
+static struct rpmpd mx_s2a_lvl = {
+	.pd = { .name = "mx", },
+	.peer = &mx_s2a_lvl_ao,
+	.res_type = RPMPD_SMPA,
+	.res_id = 2,
+	.key = KEY_LEVEL,
+};
+
+static struct rpmpd mx_s2a_lvl_ao = {
+	.pd = { .name = "mx_ao", },
+	.peer = &mx_s2a_lvl,
+	.active_only = true,
+	.res_type = RPMPD_SMPA,
+	.res_id = 2,
+	.key = KEY_LEVEL,
+};
+
 static struct rpmpd mx_rwmx0_lvl_ao;
 static struct rpmpd mx_rwmx0_lvl = {
 	.pd = { .name = "mx", },
@@ -503,19 +521,8 @@ static struct rpmpd md_s1a_corner_ao = {
 	.key = KEY_CORNER,
 };
 
-static struct rpmpd md_s1a_lvl_ao;
 static struct rpmpd md_s1a_lvl = {
 	.pd = { .name = "md", },
-	.peer = &md_s1a_lvl_ao,
-	.res_type = RPMPD_SMPA,
-	.res_id = 1,
-	.key = KEY_LEVEL,
-};
-
-static struct rpmpd md_s1a_lvl_ao = {
-	.pd = { .name = "md_ao", },
-	.peer = &md_s1a_lvl,
-	.active_only = true,
 	.res_type = RPMPD_SMPA,
 	.res_id = 1,
 	.key = KEY_LEVEL,
@@ -526,6 +533,13 @@ static struct rpmpd md_s1a_vfc = {
 	.res_type = RPMPD_SMPA,
 	.res_id = 1,
 	.key = KEY_FLOOR_CORNER,
+};
+
+static struct rpmpd md_s6a_lvl = {
+	.pd = { .name = "md", },
+	.res_type = RPMPD_SMPA,
+	.res_id = 6,
+	.key = KEY_LEVEL,
 };
 
 /* LPI_CX */
@@ -703,13 +717,11 @@ static const struct rpmpd_desc msm8917_desc = {
 };
 
 static struct rpmpd *msm8953_rpmpds[] = {
-	[MSM8953_VDDMD] =	&md_s1a_lvl,
-	[MSM8953_VDDMD_AO] =	&md_s1a_lvl_ao,
-	[MSM8953_VDDCX] =	&cx_s2a_lvl,
-	[MSM8953_VDDCX_AO] =	&cx_s2a_lvl_ao,
-	[MSM8953_VDDCX_VFL] =	&cx_s2a_vfl,
-	[MSM8953_VDDMX] =	&mx_s7a_lvl,
-	[MSM8953_VDDMX_AO] =	&mx_s7a_lvl_ao,
+	[RPMPD_VDDCX] = 	&cx_s2a_lvl,
+	[RPMPD_VDDCX_AO] =	&cx_s2a_lvl_ao,
+	[RPMPD_VDDCX_VFL] =	&cx_s2a_vfl,
+	[RPMPD_VDDMX] = 	&mx_s7a_lvl,
+	[RPMPD_VDDMX_AO] =	&mx_s7a_lvl_ao,
 };
 
 static const struct rpmpd_desc msm8953_desc = {
@@ -844,6 +856,36 @@ static const struct rpmpd_desc qm215_desc = {
 	.max_state = RPM_SMD_LEVEL_TURBO,
 };
 
+static struct rpmpd *sdm429w_rpmpds[] = {
+	[SDM429W_VDDMD] =	&md_s6a_lvl,
+	[SDM429W_VDDCX] =	&cx_s1a_lvl,
+	[SDM429W_VDDCX_AO] =	&cx_s1a_lvl_ao,
+	[SDM429W_VDDCX_VFL] =	&cx_s1a_vfl,
+	[SDM429W_VDDMX] =	&mx_s2a_lvl,
+	[SDM429W_VDDMX_AO] =	&mx_s2a_lvl_ao,
+};
+
+static const struct rpmpd_desc sdm429w_desc = {
+	.rpmpds = sdm429w_rpmpds,
+	.num_pds = ARRAY_SIZE(sdm429w_rpmpds),
+	.max_state = RPM_SMD_LEVEL_TURBO,
+};
+
+static struct rpmpd *sdm439_rpmpds[] = {
+	[SDM439_VDDMD] =	&md_s1a_lvl,
+	[SDM439_VDDCX] =	&cx_s2a_lvl,
+	[SDM439_VDDCX_AO] =	&cx_s2a_lvl_ao,
+	[SDM439_VDDCX_VFL] =	&cx_s2a_vfl,
+	[SDM439_VDDMX] =	&mx_s7a_lvl,
+	[SDM439_VDDMX_AO] =	&mx_s7a_lvl_ao,
+};
+
+static const struct rpmpd_desc sdm439_desc = {
+	.rpmpds = sdm439_rpmpds,
+	.num_pds = ARRAY_SIZE(sdm439_rpmpds),
+	.max_state = RPM_SMD_LEVEL_TURBO,
+};
+
 static struct rpmpd *sdm660_rpmpds[] = {
 	[RPMPD_VDDCX] =		&cx_rwcx0_lvl,
 	[RPMPD_VDDCX_AO] =	&cx_rwcx0_lvl_ao,
@@ -954,6 +996,8 @@ static const struct of_device_id rpmpd_match_table[] = {
 	{ .compatible = "qcom,qcm2290-rpmpd", .data = &qcm2290_desc },
 	{ .compatible = "qcom,qcs404-rpmpd", .data = &qcs404_desc },
 	{ .compatible = "qcom,qm215-rpmpd", .data = &qm215_desc },
+	{ .compatible = "qcom,sdm429w-rpmpd", .data = &sdm429w_desc },
+	{ .compatible = "qcom,sdm439-rpmpd", .data = &sdm439_desc },
 	{ .compatible = "qcom,sdm660-rpmpd", .data = &sdm660_desc },
 	{ .compatible = "qcom,shikra-rpmpd", .data = &shikra_desc },
 	{ .compatible = "qcom,sm6115-rpmpd", .data = &sm6115_desc },

@@ -10794,6 +10794,13 @@ T:	git git://linuxtv.org/media.git
 F:	Documentation/devicetree/bindings/media/i2c/galaxycore,gc2145.yaml
 F:	drivers/media/i2c/gc2145.c
 
+GALAXYCORE GC5035 SENSOR DRIVER
+M:	Tomasz Figa <tfiga@chromium.org>
+L:	linux-media@vger.kernel.org
+S:	Maintained
+T:	git git://linuxtv.org/media_tree.git
+F:	drivers/media/i2c/gc5035.c
+
 GATEWORKS SYSTEM CONTROLLER (GSC) DRIVER
 M:	Tim Harvey <tharvey@gateworks.com>
 S:	Maintained
@@ -22324,6 +22331,12 @@ S:	Maintained
 F:	Documentation/devicetree/bindings/power/supply/qcom,pmi8998-charger.yaml
 F:	drivers/power/supply/qcom_smbx.c
 
+QUALCOMM PMIC SECURE WRITE HELPERS
+M:	Yassine Oudjana <y.oudjana@protonmail.com>
+L:	linux-arm-msm@vger.kernel.org
+S:	Maintained
+F:	drivers/soc/qcom/pmic-sec-write.c
+
 QUALCOMM PPE DRIVER
 M:	Luo Jie <jie.luo@oss.qualcomm.com>
 L:	netdev@vger.kernel.org
@@ -22353,6 +22366,24 @@ F:	Documentation/networking/device_drivers/cellular/qualcomm/rmnet.rst
 F:	drivers/net/ethernet/qualcomm/rmnet/
 F:	include/linux/if_rmnet.h
 
+QUALCOMM SENSOR MANAGER IIO DRIVER
+M:	Yassine Oudjana <y.oudjana@protonmail.com>
+L:	linux-iio@vger.kernel.org
+L:	linux-arm-msm@vger.kernel.org
+S:	Maintained
+F:	drivers/iio/accel/qcom_smgr_accel.c
+F:	drivers/iio/common/qcom_smgr/Kconfig
+F:	drivers/iio/common/qcom_smgr/Makefile
+F:	drivers/iio/common/qcom_smgr/qcom_smgr.c
+F:	drivers/iio/common/qcom_smgr/qmi/Makefile
+F:	drivers/iio/common/qcom_smgr/qmi/sns_smgr.c
+F:	drivers/iio/common/qcom_smgr/qmi/sns_smgr.h
+F:	drivers/iio/gyro/qcom_smgr_gyro.c
+F:	drivers/iio/magnetometer/qcom_smgr_mag.c
+F:	drivers/iio/pressure/qcom_smgr_pressure.c
+F:	drivers/iio/proximity/qcom_smgr_prox.c
+F:	include/linux/iio/common/qcom_smgr.h
+
 QUALCOMM TEE (QCOMTEE) DRIVER
 M:	Amirreza Zarrabi <amirreza.zarrabi@oss.qualcomm.com>
 L:	linux-arm-msm@vger.kernel.org
@@ -22367,6 +22398,16 @@ S:	Maintained
 F:	drivers/firmware/qcom/qcom_tzmem.c
 F:	drivers/firmware/qcom/qcom_tzmem.h
 F:	include/linux/firmware/qcom/qcom_tzmem.h
+
+QUALCOMM SMBCHG DRIVER
+M:	Yassine Oudjana <y.oudjana@protonmail.com>
+M:	Alejandro Tafalla <atafalla@dnyon.com>
+L:	linux-pm@vger.kernel.org
+L:	linux-arm-msm@vger.kernel.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/power/supply/qcom,smbchg.yaml
+F:	drivers/power/supply/qcom-smbchg.c
+F:	drivers/power/supply/qcom-smbchg.h
 
 QUALCOMM TSENS THERMAL DRIVER
 M:	Amit Kucheria <amitk@kernel.org>

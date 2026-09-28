@@ -10,6 +10,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
+#include <linux/gpio/consumer.h>
 #include <sound/soc.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -223,6 +224,8 @@
 #define CDC_A_RX_HPH_R_PA_DAC_CTL	(0xf19D)
 #define RX_HPH_R_PA_DAC_CTL_DATA_RESET	BIT(1)
 #define RX_HPH_R_PA_DAC_CTL_DATA_RESET_MASK BIT(1)
+#define CDC_A_RX_HPH_L_TEST		(0xf19A)
+#define CDC_A_RX_HPH_R_TEST		(0xf19C)
 
 #define CDC_A_RX_EAR_CTL			(0xf19E)
 #define RX_EAR_CTL_SPK_VBAT_LDO_EN_MASK		BIT(0)
@@ -297,6 +300,7 @@ struct pm8916_wcd_analog_priv {
 	struct snd_soc_component *component;
 	struct regulator_bulk_data supplies[ARRAY_SIZE(supply_names)];
 	struct snd_soc_jack *jack;
+	struct snd_soc_jack_gpio jack_gpio;
 	bool hphl_jack_type_normally_open;
 	bool gnd_jack_type_normally_open;
 	/* Voltage threshold when internal current source of 100uA is used */
@@ -479,7 +483,7 @@ static void pm8916_wcd_setup_mbhc(struct pm8916_wcd_analog_priv *wcd)
 	struct snd_soc_component *component = wcd->component;
 	bool micbias_enabled = false;
 	u32 plug_type = 0;
-	u32 int_en_mask;
+	u32 int_en_mask = 0;
 
 	snd_soc_component_write(component, CDC_A_MBHC_DET_CTL_1,
 		      CDC_A_MBHC_DET_CTL_L_DET_EN |
@@ -514,7 +518,8 @@ static void pm8916_wcd_setup_mbhc(struct pm8916_wcd_analog_priv *wcd)
 
 	pm8916_mbhc_configure_bias(wcd, micbias_enabled);
 
-	int_en_mask = MBHC_SWITCH_INT;
+	if (!wcd->jack_gpio.report)
+		int_en_mask |= MBHC_SWITCH_INT;
 	if (wcd->mbhc_btn_enabled)
 		int_en_mask |= MBHC_BUTTON_PRESS_DET | MBHC_BUTTON_RELEASE_DET;
 
@@ -665,6 +670,48 @@ static int pm8916_wcd_analog_enable_spk_pa(struct snd_soc_dapm_widget *w,
 				    RX_EAR_CTL_SPK_VBAT_LDO_EN_MASK, 0);
 		break;
 	}
+	return 0;
+}
+
+static int pm8916_wcd_analog_enable_hph_pa(struct snd_soc_dapm_widget *w,
+					  struct snd_kcontrol *kcontrol, int event)
+{
+	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
+	struct pm8916_wcd_analog_priv *wcd = snd_soc_component_get_drvdata(component);
+	u32 other_bit;
+	u32 hph_test_reg = (w->shift == 4) ?
+		CDC_A_RX_HPH_R_TEST : CDC_A_RX_HPH_L_TEST;
+
+	switch (event) {
+	case SND_SOC_DAPM_PRE_PMU:
+		if (wcd->pmic_rev == 0 && wcd->codec_version >= 3) {
+			snd_soc_component_update_bits(component,
+					CDC_A_RX_HPH_BIAS_CNP, 0xF0, 0x20);
+		}
+		break;
+	case SND_SOC_DAPM_POST_PMU:
+		usleep_range(7000, 7500);
+		snd_soc_component_update_bits(component, hph_test_reg, 0x04, 0x04);
+		break;
+	case SND_SOC_DAPM_PRE_PMD:
+		usleep_range(10000, 12000);
+		snd_soc_component_update_bits(component, hph_test_reg, 0x04, 0x00);
+
+		if (wcd->pmic_rev == 0 && wcd->codec_version >= 3) {
+			snd_soc_component_update_bits(component,
+					CDC_A_RX_HPH_BIAS_CNP, 0xf0, 0x30);
+		}
+
+		break;
+	case SND_SOC_DAPM_POST_PMD:
+		other_bit = BIT((w->shift == 4) ? 5 : 4);
+		/* If both HPH PAs are shutting down wait after both are down */
+		if (!(snd_soc_component_read(component, w->reg) & other_bit))
+			msleep(20);
+
+		break;
+	}
+
 	return 0;
 }
 
@@ -883,11 +930,17 @@ static const struct snd_soc_dapm_widget pm8916_wcd_analog_dapm_widgets[] = {
 	SND_SOC_DAPM_MUX("EAR_S", SND_SOC_NOPM, 0, 0, &ear_mux),
 	SND_SOC_DAPM_SUPPLY("EAR CP", CDC_A_NCP_EN, 4, 0, NULL, 0),
 
-	SND_SOC_DAPM_PGA("HPHL PA", CDC_A_RX_HPH_CNP_EN, 5, 0, NULL, 0),
+	SND_SOC_DAPM_PGA_E("HPHL PA", CDC_A_RX_HPH_CNP_EN, 5, 0, NULL, 0,
+			   pm8916_wcd_analog_enable_hph_pa,
+			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
+			   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMD),
 	SND_SOC_DAPM_MUX("HPHL", SND_SOC_NOPM, 0, 0, &hphl_mux),
 	SND_SOC_DAPM_MIXER("HPHL DAC", CDC_A_RX_HPH_L_PA_DAC_CTL, 3, 0, NULL,
 			   0),
-	SND_SOC_DAPM_PGA("HPHR PA", CDC_A_RX_HPH_CNP_EN, 4, 0, NULL, 0),
+	SND_SOC_DAPM_PGA_E("HPHR PA", CDC_A_RX_HPH_CNP_EN, 4, 0, NULL, 0,
+			   pm8916_wcd_analog_enable_hph_pa,
+			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
+			   SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMD),
 	SND_SOC_DAPM_MUX("HPHR", SND_SOC_NOPM, 0, 0, &hphr_mux),
 	SND_SOC_DAPM_MIXER("HPHR DAC", CDC_A_RX_HPH_R_PA_DAC_CTL, 3, 0, NULL,
 			   0),
@@ -979,6 +1032,22 @@ static int pm8916_wcd_analog_set_jack(struct snd_soc_component *component,
 {
 	struct pm8916_wcd_analog_priv *wcd = snd_soc_component_get_drvdata(component);
 
+	if (wcd->jack_gpio.report && wcd->jack != jack) {
+		int ret;
+
+		if (wcd->jack)
+			snd_soc_jack_free_gpios(wcd->jack, 1, &wcd->jack_gpio);
+
+		if (jack) {
+			ret = snd_soc_jack_add_gpiods(component->dev, jack,
+						      1, &wcd->jack_gpio);
+			if (ret)
+				dev_err(component->dev,
+					"Failed to add GPIO to jack: %d\n",
+					ret);
+		}
+	}
+
 	wcd->jack = jack;
 
 	return 0;
@@ -1040,15 +1109,10 @@ static irqreturn_t mbhc_btn_press_irq_handler(int irq, void *arg)
 	return IRQ_HANDLED;
 }
 
-static irqreturn_t pm8916_mbhc_switch_irq_handler(int irq, void *arg)
+static int pm8916_wcd_analog_switch_check(struct pm8916_wcd_analog_priv *priv, bool ins)
 {
-	struct pm8916_wcd_analog_priv *priv = arg;
 	struct snd_soc_component *component = priv->component;
-	bool ins = false;
-
-	if (snd_soc_component_read(component, CDC_A_MBHC_DET_CTL_1) &
-				CDC_A_MBHC_DET_CTL_MECH_DET_TYPE_MASK)
-		ins = true;
+	int report;
 
 	/* Set the detection type appropriately */
 	snd_soc_component_update_bits(component, CDC_A_MBHC_DET_CTL_1,
@@ -1072,21 +1136,44 @@ static irqreturn_t pm8916_mbhc_switch_irq_handler(int irq, void *arg)
 		 * a headset.
 		 */
 		if (priv->mbhc_btn0_released)
-			snd_soc_jack_report(priv->jack,
-					    SND_JACK_HEADSET, hs_jack_mask);
+			report = SND_JACK_HEADSET;
 		else
-			snd_soc_jack_report(priv->jack,
-					    SND_JACK_HEADPHONE, hs_jack_mask);
+			report = SND_JACK_HEADPHONE;
 
 		priv->detect_accessory_type = false;
 
 	} else { /* removal */
-		snd_soc_jack_report(priv->jack, 0, hs_jack_mask);
+		report = 0;
 		priv->detect_accessory_type = true;
 		priv->mbhc_btn0_released = false;
 	}
 
+	return report;
+}
+
+static irqreturn_t pm8916_mbhc_switch_irq_handler(int irq, void *arg)
+{
+	struct pm8916_wcd_analog_priv *priv = arg;
+	struct snd_soc_component *component = priv->component;
+	bool ins = false;
+	int report;
+
+	if (snd_soc_component_read(component, CDC_A_MBHC_DET_CTL_1) &
+				CDC_A_MBHC_DET_CTL_MECH_DET_TYPE_MASK)
+		ins = true;
+
+	report = pm8916_wcd_analog_switch_check(priv, ins);
+	snd_soc_jack_report(priv->jack, report, hs_jack_mask);
+
 	return IRQ_HANDLED;
+}
+
+static int pm8916_wcd_analog_jack_status_check(void *data)
+{
+	struct pm8916_wcd_analog_priv *wcd = data;
+	bool ins = gpiod_get_value_cansleep(wcd->jack_gpio.desc);
+
+	return pm8916_wcd_analog_switch_check(wcd, ins);
 }
 
 static struct snd_soc_dai_driver pm8916_wcd_analog_dai[] = {
@@ -1207,18 +1294,27 @@ static int pm8916_wcd_analog_spmi_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	irq = platform_get_irq_byname(pdev, "mbhc_switch_int");
-	if (irq < 0)
-		return irq;
+	if (gpiod_count(dev, "jack") > 0) {
+		priv->jack_gpio.name = "jack";
+		priv->jack_gpio.report = hs_jack_mask;
+		priv->jack_gpio.debounce_time = 100;
+		priv->jack_gpio.jack_status_check =
+			pm8916_wcd_analog_jack_status_check;
+		priv->jack_gpio.data = priv;
+	} else {
+		irq = platform_get_irq_byname(pdev, "mbhc_switch_int");
+		if (irq < 0)
+			return irq;
 
-	ret = devm_request_threaded_irq(dev, irq, NULL,
-			       pm8916_mbhc_switch_irq_handler,
-			       IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING |
-			       IRQF_ONESHOT,
-			       "mbhc switch irq", priv);
-	if (ret) {
-		dev_err(dev, "cannot request mbhc switch irq\n");
-		return ret;
+		ret = devm_request_threaded_irq(dev, irq, NULL,
+				       pm8916_mbhc_switch_irq_handler,
+				       IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING |
+				       IRQF_ONESHOT,
+				       "mbhc switch irq", priv);
+		if (ret) {
+			dev_err(dev, "cannot request mbhc switch irq\n");
+			return ret;
+		}
 	}
 
 	if (priv->mbhc_btn_enabled) {

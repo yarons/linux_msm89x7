@@ -11,6 +11,7 @@
 #include "msm8937.dtsi"
 #include "pm8937.dtsi"
 #include "pmi8950.dtsi"
+#include "msm8937-qdsp6.dtsi"
 
 /delete-node/ &qseecom_mem;
 
@@ -25,6 +26,23 @@
 	aliases {
 		mmc0 = &sdhc_1;
 		mmc1 = &sdhc_2;
+	};
+
+	speaker_amp: audio-amplifier {
+		compatible = "awinic,aw8738";
+		mode-gpios = <&tlmm 124 GPIO_ACTIVE_HIGH>;
+		awinic,mode = <5>;
+		sound-name-prefix = "Speaker Amp";
+		pinctrl-0 = <&speaker_amp_default>;
+		pinctrl-names = "default";
+	};
+
+	headphones_switch: audio-switch {
+		compatible = "simple-audio-amplifier";
+		enable-gpios = <&tlmm 129 GPIO_ACTIVE_HIGH>;
+		sound-name-prefix = "Headphones Switch";
+		pinctrl-0 = <&headphones_switch_default>;
+		pinctrl-names = "default";
 	};
 
 	battery: battery {
@@ -59,6 +77,7 @@
 				 <&gcc GCC_MDSS_PCLK0_CLK>,
 				 <&gcc GCC_MDSS_ESC0_CLK>;
 			power-domains = <&gcc MDSS_GDSC>;
+			status = "disabled";
 		};
 	};
 
@@ -101,6 +120,18 @@
 		regulator-always-on;
 		regulator-boot-on;
 	};
+};
+
+&adsp {
+	status = "okay";
+};
+
+&adsp_mem {
+	status = "okay";
+};
+
+&apr {
+	status = "okay";
 };
 
 &blsp1_i2c2 {
@@ -158,6 +189,146 @@
 	};
 };
 
+&camss {
+	vdda-supply = <&pm8937_l2>;
+	status = "okay";
+
+	ports {
+		port@0 {
+			reg = <0>;
+
+			csiphy0_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&rear_cam_ep>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+
+			csiphy1_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1>;
+				remote-endpoint = <&front_cam_ep>;
+			};
+		};
+	};
+};
+
+&cci {
+	pinctrl-0 = <&cci0_default>;
+	pinctrl-names = "default";
+
+	status = "okay";
+};
+
+&cci_i2c0 {
+	camera-sensor@10 {
+		compatible = "samsung,s5k3l8";
+
+		reg = <0x10>;
+
+		clocks = <&gcc GCC_CAMSS_MCLK0_CLK>;
+		clock-frequency = <24000000>;
+
+		pinctrl-0 = <&cam_sensor_rear_default>, <&camss_mclk0_default>;
+		pinctrl-names = "default";
+
+		reset-gpios = <&tlmm 35 GPIO_ACTIVE_LOW>;
+
+		avdd-supply= <&pm8937_l22>;
+		dvdd-supply = <&pm8937_l23>;
+		vio-supply = <&pm8937_l6>;
+		aux-supply = <&pm8937_l17>;
+
+		orientation = <1>;
+		rotation = <270>;
+
+		port {
+			rear_cam_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&csiphy0_ep>;
+			};
+		};
+	};
+
+	camera-sensor@36 {
+		compatible = "ovti,ov5670";
+
+		reg = <0x36>;
+
+		clocks = <&gcc GCC_CAMSS_MCLK2_CLK>;
+
+		pinctrl-0 = <&cam_sensor_front_default>, <&camss_mclk2_default>;
+		pinctrl-names = "default";
+
+		reset-gpios = <&tlmm 40 GPIO_ACTIVE_LOW>;
+
+		avdd-supply= <&pm8937_l22>;
+		dvdd-supply = <&pm8937_l23>;
+		dovdd-supply = <&pm8937_l6>;
+		orientation = <0>;
+		rotation = <270>;
+
+		port {
+			front_cam_ep: endpoint {
+				data-lanes = <0 1>;
+				remote-endpoint = <&csiphy1_ep>;
+				link-frequencies = /bits/ 64 <450000000>;
+			};
+		};
+	};
+};
+
+&gpu {
+	status = "okay";
+};
+
+&lpass_codec{
+	status = "okay";
+};
+
+&mdss {
+	status = "okay";
+};
+
+&mdss_dsi0 {
+	vdda-supply = <&pm8937_l2>;
+	vddio-supply = <&pm8937_l6>;
+
+	status = "okay";
+
+	panel@0 {
+		compatible = "xiaomi,land-panel";
+		reg = <0>;
+
+		reset-gpios = <&tlmm 60 GPIO_ACTIVE_LOW>;
+		backlight = <&pmi8950_wled>;
+
+		pinctrl-0 = <&panel_default>;
+		pinctrl-names = "default";
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&mdss_dsi0_out>;
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	data-lanes = <0 1 2 3>;
+	remote-endpoint = <&panel_in>;
+};
+
+&mdss_dsi0_phy {
+	vddio-supply = <&pm8937_l6>;
+	qcom,dsi-phy-regulator-ldo-mode;
+
+	status = "okay";
+};
+
 &pm8937_resin {
 	linux,code = <KEY_VOLUMEDOWN>;
 
@@ -172,6 +343,42 @@
 		regulator-always-on;
 		regulator-boot-on;
 	};
+};
+
+&pmi8950_fg {
+	monitored-battery = <&battery>;
+	power-supplies = <&pmi8950_smbcharger>;
+	status = "okay";
+};
+
+&pmi8950_flash {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	led@0 {
+		reg = <0>;
+		function = LED_FUNCTION_FLASH;
+		color = <LED_COLOR_ID_WHITE>;
+		led-max-microamp = <200000>;
+		flash-max-microamp = <1000000>;
+		flash-max-timeout-us = <1280000>;
+	};
+};
+
+&pmi8950_haptics {
+	qcom,actuator-type = <HAP_TYPE_ERM>;
+	qcom,brake-pattern = <0x3 0x3 0x0 0x0>;
+	qcom,wave-play-rate-us = <5263>;
+	qcom,wave-shape = <HAP_WAVE_SQUARE>;
+	qcom,vmax-millivolt = <2700>;
+
+	status = "okay";
+};
+
+&pmi8950_smbcharger {
+	monitored-battery = <&battery>;
+	status = "okay";
 };
 
 &pmi8950_wled {
@@ -333,8 +540,48 @@
 	clock-frequency = <32768>;
 };
 
+&sound {
+	model = "xiaomi-land";
+
+	aux-devs = <&speaker_amp>, <&headphones_switch>;
+	widgets =
+		"Speaker", "Speaker",
+		"Headphone", "Headphones";
+	pin-switches = "Speaker", "Headphones";
+	audio-routing =
+		"Speaker", "Speaker Amp OUT",
+		"Speaker Amp IN", "HPHR",
+		"Headphones", "Headphones Switch OUTL",
+		"Headphones", "Headphones Switch OUTR",
+		"Headphones Switch INL", "HPHL",
+		"Headphones Switch INR", "HPHR",
+		"AMIC1", "MIC BIAS External1",
+		"AMIC2", "MIC BIAS Internal2",
+		"AMIC3", "MIC BIAS External1",
+		"MM_DL1", "MultiMedia1 Playback",
+		"MM_DL3", "MultiMedia3 Playback",
+		"MM_DL4", "MultiMedia4 Playback",
+		"MultiMedia2 Capture", "MM_UL2";
+
+	status = "okay";
+};
+
 &tlmm {
 	gpio-reserved-ranges = <0 4>, <20 4>;
+
+	cam_sensor_front_default: cam-sensor-front-default-state {
+		pins = "gpio39", "gpio40";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam_sensor_rear_default: cam-sensor-rear-default-state {
+		pins = "gpio35", "gpio36";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
 
 	gpio_keys_default: gpio-keys-default-state {
 		pins = "gpio91";
@@ -343,8 +590,30 @@
 		bias-pull-up;
 	};
 
+	headphones_switch_default: headphones-switch-default-state {
+		pins = "gpio129";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	panel_default: panel-default-state {
+		pins = "gpio60";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+		output-high;
+	};
+
 	sdc2_cd_default: sdc2-cd-default-state {
 		pins = "gpio67";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	speaker_amp_default: speaker-amp-default-state {
+		pins = "gpio124";
 		function = "gpio";
 		drive-strength = <2>;
 		bias-disable;
@@ -356,6 +625,40 @@
 		drive-strength = <8>;
 		bias-pull-up;
 	};
+};
+
+&usb {
+	dr_mode = "otg";
+	extcon = <&pmi8950_smbcharger>, <&pmi8950_smbcharger>;
+	vbus-supply = <&otg_vbus>;
+	status = "okay";
+};
+
+&usb_hs_phy {
+	vdd-supply = <&pm8937_l2>;
+	vdda1p8-supply = <&pm8937_l7>;
+	vdda3p3-supply = <&pm8937_l13>;
+	status = "okay";
+};
+
+&venus {
+	status = "okay";
+};
+
+&venus_mem {
+	status = "okay";
+};
+
+&wcd_codec {
+	qcom,hphl-jack-type-normally-open;
+	qcom,mbhc-vthreshold-high = <75 225 450 510 540>;
+	qcom,mbhc-vthreshold-low = <25 200 325 500 530>;
+	qcom,micbias1-ext-cap;
+
+	vdd-cdc-io-supply = <&pm8937_l5>;
+	vdd-cdc-tx-rx-cx-supply = <&pm8937_s4>;
+	vdd-micbias-supply = <&pm8937_l13>;
+	status = "okay";
 };
 
 &wcnss {
