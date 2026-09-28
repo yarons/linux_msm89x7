@@ -151,22 +151,40 @@ int dt_idle_pd_init_topology(struct device_node *np)
 int dt_idle_pd_remove_topology(struct device_node *np)
 {
 	struct of_phandle_args child, parent;
-	int ret;
+	bool removed;
+	int ret, err;
 
-	for_each_child_of_node_scoped(np, node) {
-		if (of_parse_phandle_with_args(node, "power-domains",
-					"#power-domain-cells", 0, &parent))
-			continue;
+	/*
+	 * genpd only lets a subdomain go from its parent once the subdomain
+	 * has no subdomains of its own, so the links must be taken down from
+	 * the leaves up. The order of the child nodes says nothing about
+	 * that, and after a failed dt_idle_pd_init_topology() some links were
+	 * never made at all. Sweep the nodes until a pass removes nothing:
+	 * links that are not there, or whose parent was never found, are
+	 * skipped, and only a link that cannot be removed (-EBUSY) is an
+	 * error.
+	 */
+	do {
+		removed = false;
+		ret = 0;
 
-		child.np = node;
-		child.args_count = 0;
-		ret = of_genpd_remove_subdomain(&parent, &child);
-		of_node_put(parent.np);
-		if (ret)
-			return ret;
-	}
+		for_each_child_of_node_scoped(np, node) {
+			if (of_parse_phandle_with_args(node, "power-domains",
+						"#power-domain-cells", 0, &parent))
+				continue;
 
-	return 0;
+			child.np = node;
+			child.args_count = 0;
+			err = of_genpd_remove_subdomain(&parent, &child);
+			of_node_put(parent.np);
+			if (!err)
+				removed = true;
+			else if (err == -EBUSY)
+				ret = err;
+		}
+	} while (removed);
+
+	return ret;
 }
 
 struct device *dt_idle_attach_cpu(int cpu, const char *name)
