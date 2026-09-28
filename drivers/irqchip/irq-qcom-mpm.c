@@ -415,18 +415,27 @@ static int qcom_mpm_probe(struct platform_device *pdev, struct device_node *pare
 	if (irq < 0)
 		return irq;
 
+	priv->mbox_client.dev = dev;
+	priv->mbox_client.knows_txdone = true;
+	priv->mbox_chan = mbox_request_channel(&priv->mbox_client, 0);
+	if (IS_ERR(priv->mbox_chan))
+		return dev_err_probe(dev, PTR_ERR(priv->mbox_chan),
+				     "failed to acquire IPC channel\n");
+
 	genpd = &priv->genpd;
 	genpd->flags = GENPD_FLAG_IRQ_SAFE;
 	genpd->power_off = mpm_pd_power_off;
 
 	genpd->name = devm_kasprintf(dev, GFP_KERNEL, "%s", dev_name(dev));
-	if (!genpd->name)
-		return -ENOMEM;
+	if (!genpd->name) {
+		ret = -ENOMEM;
+		goto free_mbox;
+	}
 
 	ret = pm_genpd_init(genpd, NULL, false);
 	if (ret) {
 		dev_err(dev, "failed to init genpd: %d\n", ret);
-		return ret;
+		goto free_mbox;
 	}
 
 	ret = of_genpd_add_provider_simple(np, genpd);
@@ -435,20 +444,11 @@ static int qcom_mpm_probe(struct platform_device *pdev, struct device_node *pare
 		goto remove_genpd;
 	}
 
-	priv->mbox_client.dev = dev;
-	priv->mbox_client.knows_txdone = true;
-	priv->mbox_chan = mbox_request_channel(&priv->mbox_client, 0);
-	if (IS_ERR(priv->mbox_chan)) {
-		ret = PTR_ERR(priv->mbox_chan);
-		dev_err(dev, "failed to acquire IPC channel: %d\n", ret);
-		return ret;
-	}
-
 	parent_domain = irq_find_host(parent);
 	if (!parent_domain) {
 		dev_err(dev, "failed to find MPM parent domain\n");
 		ret = -ENXIO;
-		goto free_mbox;
+		goto del_provider;
 	}
 
 	priv->domain = irq_domain_create_hierarchy(parent_domain,
@@ -457,7 +457,7 @@ static int qcom_mpm_probe(struct platform_device *pdev, struct device_node *pare
 	if (!priv->domain) {
 		dev_err(dev, "failed to create MPM domain\n");
 		ret = -ENOMEM;
-		goto free_mbox;
+		goto del_provider;
 	}
 
 	irq_domain_update_bus_token(priv->domain, DOMAIN_BUS_WAKEUP);
@@ -473,10 +473,12 @@ static int qcom_mpm_probe(struct platform_device *pdev, struct device_node *pare
 
 remove_domain:
 	irq_domain_remove(priv->domain);
-free_mbox:
-	mbox_free_channel(priv->mbox_chan);
+del_provider:
+	of_genpd_del_provider(np);
 remove_genpd:
 	pm_genpd_remove(genpd);
+free_mbox:
+	mbox_free_channel(priv->mbox_chan);
 	return ret;
 }
 
