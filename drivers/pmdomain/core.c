@@ -2865,7 +2865,14 @@ void of_genpd_del_provider(struct device_node *np)
 			 * so that the PM domain can be safely removed.
 			 */
 			list_for_each_entry(gpd, &gpd_list, gpd_list_node) {
-				if (gpd->provider == of_fwnode_handle(np)) {
+				/*
+				 * A domain that could not be removed after an
+				 * earlier provider for the same node was
+				 * deleted still points at the node, but its
+				 * device is already gone.
+				 */
+				if (gpd->provider == of_fwnode_handle(np) &&
+				    gpd->has_provider) {
 					gpd->has_provider = false;
 
 					if (gpd->opp_table) {
