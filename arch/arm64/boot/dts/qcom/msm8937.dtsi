@@ -822,7 +822,7 @@
 			compatible = "qcom,usb-hs-28nm-femtophy";
 			reg = <0x0006c000 0x200>;
 			#phy-cells = <0>;
-			clocks = <&rpmcc RPM_SMD_XO_CLK_SRC>,
+			clocks = <&rpmcc RPM_SMD_XO_A_CLK_SRC>,
 				 <&gcc GCC_USB_HS_PHY_CFG_AHB_CLK>,
 				 <&gcc GCC_USB2A_PHY_SLEEP_CLK>;
 			clock-names = "ref",
@@ -1240,7 +1240,7 @@
 			#clock-cells = <1>;
 			#reset-cells = <1>;
 			#power-domain-cells = <1>;
-			clocks = <&rpmcc RPM_SMD_XO_CLK_SRC>,
+			clocks = <&rpmcc RPM_SMD_XO_A_CLK_SRC>,
 				 <&sleep_clk>,
 				 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>,
 				 <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
@@ -1938,7 +1938,7 @@
 					  "pwr_irq";
 			clocks = <&gcc GCC_SDCC1_AHB_CLK>,
 				 <&gcc GCC_SDCC1_APPS_CLK>,
-				 <&rpmcc RPM_SMD_XO_CLK_SRC>;
+				 <&rpmcc RPM_SMD_XO_A_CLK_SRC>;
 			clock-names = "iface",
 				      "core",
 				      "xo";
@@ -1968,7 +1968,7 @@
 					  "pwr_irq";
 			clocks = <&gcc GCC_SDCC2_AHB_CLK>,
 				 <&gcc GCC_SDCC2_APPS_CLK>,
-				 <&rpmcc RPM_SMD_XO_CLK_SRC>;
+				 <&rpmcc RPM_SMD_XO_A_CLK_SRC>;
 			clock-names = "iface",
 				      "core",
 				      "xo";
@@ -2285,7 +2285,7 @@
 			compatible = "qcom,msm8939-apcs-kpss-global", "syscon";
 			reg = <0x0b011000 0x1000>;
 			#mbox-cells = <1>;
-			clocks = <&a53pll_c1>, <&gcc GPLL0_EARLY>, <&rpmcc RPM_SMD_XO_CLK_SRC>;
+			clocks = <&a53pll_c1>, <&gcc GPLL0_EARLY>, <&rpmcc RPM_SMD_XO_A_CLK_SRC>;
 			clock-names = "pll", "aux", "ref";
 			#clock-cells = <0>;
 			assigned-clocks = <&apcs2>;
@@ -2339,7 +2339,7 @@
 			compatible = "qcom,msm8939-apcs-kpss-global", "syscon";
 			reg = <0x0b111000 0x1000>;
 			#mbox-cells = <1>;
-			clocks = <&a53pll_c0>, <&gcc GPLL0_EARLY>, <&rpmcc RPM_SMD_XO_CLK_SRC>;
+			clocks = <&a53pll_c0>, <&gcc GPLL0_EARLY>, <&rpmcc RPM_SMD_XO_A_CLK_SRC>;
 			clock-names = "pll", "aux", "ref";
 			#clock-cells = <0>;
 		};
@@ -2438,7 +2438,7 @@
 			#mbox-cells = <1>;
 			clocks = <&gcc GPLL0_EARLY>,
 				 <&gcc GPLL0_EARLY>,
-				 <&rpmcc RPM_SMD_XO_CLK_SRC>;
+				 <&rpmcc RPM_SMD_XO_A_CLK_SRC>;
 			clock-names = "pll", "aux", "ref";
 			#clock-cells = <0>;
 		};
@@ -2463,7 +2463,7 @@
 
 			clocks = <&q6afecc LPASS_CLK_ID_INTERNAL_DIGITAL_CODEC_CORE
 					   LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
-				 <&rpmcc RPM_SMD_XO_CLK_SRC>;
+				 <&rpmcc RPM_SMD_XO_A_CLK_SRC>;
 			clock-names = "mclk", "ahbix-clk";
 			assigned-clocks = <&q6afecc LPASS_CLK_ID_INTERNAL_DIGITAL_CODEC_CORE
 						    LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
