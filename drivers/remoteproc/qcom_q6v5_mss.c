@@ -2345,6 +2345,7 @@ static const struct rproc_hexagon_res sdm439_mss = {
 	.has_ext_cntl_regs = false,
 	.has_vq6 = false,
 	.version = MSS_SDM439,
+	.ssctl_id = 0x12,
 };
 
 static const struct rproc_hexagon_res sdm660_mss = {
