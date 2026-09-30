@@ -164,10 +164,19 @@ static void mdp5_vid_encoder_enable(struct drm_encoder *encoder)
 	if (WARN_ON(mdp5_encoder->enabled))
 		return;
 
+	/*
+	 * Flush first: on a full modeset the planes' flush bits were
+	 * deferred to here (defer_start). Starting the timing engine before
+	 * the flush lets the first frame be fetched with the pipes' previous
+	 * (after a power collapse: reset) source addresses. On msm8937 that
+	 * faults in the IOMMU at iova 0 on every fetch, and with
+	 * stall-on-fault the frame, and with it the flush, may never
+	 * complete.
+	 */
+	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf), true);
 	spin_lock_irqsave(&mdp5_encoder->intf_lock, flags);
 	mdp5_write(mdp5_kms, REG_MDP5_INTF_TIMING_ENGINE_EN(intfn), 1);
 	spin_unlock_irqrestore(&mdp5_encoder->intf_lock, flags);
-	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf), true);
 
 	mdp5_ctl_set_encoder_state(ctl, pipeline, true);
 
