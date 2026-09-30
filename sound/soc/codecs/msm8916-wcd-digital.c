@@ -226,6 +226,7 @@ struct wcd_iir_filter_ctl {
 
 struct msm8916_wcd_digital_priv {
 	struct clk *ahbclk, *mclk;
+	struct regmap *regmap;
 };
 
 static const unsigned long rx_gain_reg[] = {
@@ -718,6 +719,46 @@ static const struct snd_kcontrol_new iir1_inp1_mux =
 static const struct snd_kcontrol_new iir2_inp1_mux =
 	SOC_DAPM_ENUM("IIR2 INP1 Mux", iir2_inp1_mux_enum);
 
+/*
+ * The codec core clock is provided by the ADSP. While it is enabled the ADSP
+ * can not power collapse, so only keep it on while an audio path is powered.
+ * Register accesses need the clock: keep the register map cache-only while it
+ * is off and write back what changed in the meantime when it comes back.
+ */
+static int msm8916_wcd_digital_mclk_event(struct snd_soc_dapm_widget *w,
+					  struct snd_kcontrol *kcontrol,
+					  int event)
+{
+	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
+	struct msm8916_wcd_digital_priv *priv = snd_soc_component_get_drvdata(component);
+	int ret;
+
+	switch (event) {
+	case SND_SOC_DAPM_PRE_PMU:
+		ret = clk_prepare_enable(priv->mclk);
+		if (ret) {
+			dev_err(component->dev, "failed to enable mclk: %d\n", ret);
+			return ret;
+		}
+
+		regcache_cache_only(priv->regmap, false);
+		ret = regcache_sync(priv->regmap);
+		if (ret) {
+			dev_err(component->dev, "failed to sync registers: %d\n", ret);
+			regcache_cache_only(priv->regmap, true);
+			clk_disable_unprepare(priv->mclk);
+			return ret;
+		}
+		break;
+	case SND_SOC_DAPM_POST_PMD:
+		regcache_cache_only(priv->regmap, true);
+		clk_disable_unprepare(priv->mclk);
+		break;
+	}
+
+	return 0;
+}
+
 static const struct snd_soc_dapm_widget msm8916_wcd_digital_dapm_widgets[] = {
 	/*RX stuff */
 	SND_SOC_DAPM_AIF_IN("I2S RX1", NULL, 0, SND_SOC_NOPM, 0, 0),
@@ -800,7 +841,9 @@ static const struct snd_soc_dapm_widget msm8916_wcd_digital_dapm_widgets[] = {
 	SND_SOC_DAPM_SUPPLY("TX_I2S_CLK", LPASS_CDC_CLK_TX_I2S_CTL, 4, 0,
 			    NULL, 0),
 
-	SND_SOC_DAPM_SUPPLY("MCLK", SND_SOC_NOPM, 0, 0, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("MCLK", SND_SOC_NOPM, 0, 0,
+			    msm8916_wcd_digital_mclk_event,
+			    SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
 	SND_SOC_DAPM_SUPPLY("PDM_CLK", LPASS_CDC_CLK_PDM_CTL, 0, 0, NULL, 0),
 	/* Connectivity Clock */
 	SND_SOC_DAPM_SUPPLY_S("CDC_CONN", -2, LPASS_CDC_CLK_OTHR_CTL, 2, 0,
@@ -1160,6 +1203,7 @@ static const struct regmap_config msm8916_codec_regmap_config = {
 	.reg_stride = 4,
 	.val_bits = 32,
 	.max_register = LPASS_CDC_TX2_DMIC_CTL,
+	.num_reg_defaults_raw = LPASS_CDC_TX2_DMIC_CTL / 4 + 1,
 	.cache_type = REGCACHE_FLAT,
 };
 
@@ -1179,12 +1223,6 @@ static int msm8916_wcd_digital_probe(struct platform_device *pdev)
 	if (IS_ERR(base))
 		return PTR_ERR(base);
 
-	digital_map =
-	    devm_regmap_init_mmio(&pdev->dev, base,
-				  &msm8916_codec_regmap_config);
-	if (IS_ERR(digital_map))
-		return PTR_ERR(digital_map);
-
 	ret = msm8916_wcd_digital_get_clks(pdev, priv);
 	if (ret < 0)
 		return ret;
@@ -1195,11 +1233,24 @@ static int msm8916_wcd_digital_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	/* The register defaults are read back from the hardware */
 	ret = clk_prepare_enable(priv->mclk);
 	if (ret < 0) {
 		dev_err(dev, "failed to enable mclk %d\n", ret);
 		goto err_clk;
 	}
+
+	digital_map =
+	    devm_regmap_init_mmio(&pdev->dev, base,
+				  &msm8916_codec_regmap_config);
+	clk_disable_unprepare(priv->mclk);
+	if (IS_ERR(digital_map)) {
+		ret = PTR_ERR(digital_map);
+		goto err_clk;
+	}
+
+	priv->regmap = digital_map;
+	regcache_cache_only(digital_map, true);
 
 	dev_set_drvdata(dev, priv);
 
@@ -1207,12 +1258,10 @@ static int msm8916_wcd_digital_probe(struct platform_device *pdev)
 				      msm8916_wcd_digital_dai,
 				      ARRAY_SIZE(msm8916_wcd_digital_dai));
 	if (ret)
-		goto err_mclk;
+		goto err_clk;
 
 	return 0;
 
-err_mclk:
-	clk_disable_unprepare(priv->mclk);
 err_clk:
 	clk_disable_unprepare(priv->ahbclk);
 	return ret;
@@ -1222,7 +1271,6 @@ static void msm8916_wcd_digital_remove(struct platform_device *pdev)
 {
 	struct msm8916_wcd_digital_priv *priv = dev_get_drvdata(&pdev->dev);
 
-	clk_disable_unprepare(priv->mclk);
 	clk_disable_unprepare(priv->ahbclk);
 }
 
