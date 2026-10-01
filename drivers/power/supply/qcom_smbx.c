@@ -823,6 +823,7 @@ static enum power_supply_property smb_properties[] = {
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_USB_TYPE,
+	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 };
 
 static int smb_get_prop_usb_online(struct smb_chip *chip, int *val)
@@ -1145,6 +1146,88 @@ static int smb_get_prop_health(struct smb_chip *chip, int *val)
 	return 0;
 }
 
+/*
+ * charge_behaviour: "auto" charges as usual, "inhibit-charge" clears the
+ * charger's enable command, so that the battery is neither charged nor used
+ * while the system keeps running from USB (unlike suspending USBIN). Lets
+ * userspace hold the battery below full, e.g. LineageOS' charging control.
+ */
+static int smb_get_charge_behaviour(struct smb_chip *chip, int *val)
+{
+	unsigned int cmd;
+	int rc;
+
+	rc = regmap_read(chip->regmap, chip->base + CHARGING_ENABLE_CMD, &cmd);
+	if (rc < 0)
+		return rc;
+
+	*val = (cmd & CHARGING_ENABLE_CMD_BIT) ?
+		POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO :
+		POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
+	return 0;
+}
+
+static int smb_set_charge_behaviour(struct smb_chip *chip, int val)
+{
+	switch (val) {
+	case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
+		return regmap_update_bits(chip->regmap,
+					  chip->base + CHARGING_ENABLE_CMD,
+					  CHARGING_ENABLE_CMD_BIT,
+					  CHARGING_ENABLE_CMD_BIT);
+	case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
+		return regmap_update_bits(chip->regmap,
+					  chip->base + CHARGING_ENABLE_CMD,
+					  CHARGING_ENABLE_CMD_BIT, 0);
+	default:
+		return -EINVAL;
+	}
+}
+
+/*
+ * charging_enabled: the same switch as a plain 1/0 file, the form charging
+ * control in LineageOS' health HAL reads and writes (it compares the whole
+ * file, which the bracketed charge_behaviour list would not match).
+ */
+static ssize_t charging_enabled_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct smb_chip *chip = power_supply_get_drvdata(to_power_supply(dev));
+	int behaviour, rc;
+
+	rc = smb_get_charge_behaviour(chip, &behaviour);
+	if (rc < 0)
+		return rc;
+
+	return sysfs_emit(buf, "%d\n",
+			  behaviour == POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO);
+}
+
+static ssize_t charging_enabled_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct smb_chip *chip = power_supply_get_drvdata(to_power_supply(dev));
+	bool enable;
+	int rc;
+
+	rc = kstrtobool(buf, &enable);
+	if (rc < 0)
+		return rc;
+
+	rc = smb_set_charge_behaviour(chip, enable ?
+			POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO :
+			POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE);
+	return rc < 0 ? rc : count;
+}
+static DEVICE_ATTR_RW(charging_enabled);
+
+static struct attribute *smb_chg_attrs[] = {
+	&dev_attr_charging_enabled.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(smb_chg);
+
 static int smb_get_property(struct power_supply *psy,
 			     enum power_supply_property psp,
 			     union power_supply_propval *val)
@@ -1174,6 +1257,8 @@ static int smb_get_property(struct power_supply *psy,
 		return smb_get_prop_health(chip, &val->intval);
 	case POWER_SUPPLY_PROP_USB_TYPE:
 		return smb_apsd_get_charger_type(chip, &val->intval);
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		return smb_get_charge_behaviour(chip, &val->intval);
 	default:
 		dev_err(chip->dev, "invalid property: %d\n", psp);
 		return -EINVAL;
@@ -1192,6 +1277,8 @@ static int smb_set_property(struct power_supply *psy,
 					  USBIN_SUSPEND_BIT, !val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return smb_set_current_limit(chip, val->intval);
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		return smb_set_charge_behaviour(chip, val->intval);
 	default:
 		dev_err(chip->dev, "No setter for property: %d\n", psp);
 		return -EINVAL;
@@ -1204,6 +1291,7 @@ static int smb_property_is_writable(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
 		return 1;
 	default:
 		return 0;
@@ -2201,6 +2289,8 @@ static const struct power_supply_desc smb_psy_desc = {
 		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
 		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |
 		     BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN),
+	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
+			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
 	.properties = smb_properties,
 	.num_properties = ARRAY_SIZE(smb_properties),
 	.get_property = smb_get_property,
@@ -3100,8 +3190,10 @@ static int smb_probe(struct platform_device *pdev)
 	if (!desc->name)
 		return -ENOMEM;
 
+	supply_config.attr_grp = smb_chg_groups;
 	chip->chg_psy =
 		devm_power_supply_register(chip->dev, desc, &supply_config);
+	supply_config.attr_grp = NULL;
 	if (IS_ERR(chip->chg_psy))
 		return dev_err_probe(chip->dev, PTR_ERR(chip->chg_psy),
 				     "failed to register power supply\n");
