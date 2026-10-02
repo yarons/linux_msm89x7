@@ -1169,19 +1169,34 @@ static int smb_get_charge_behaviour(struct smb_chip *chip, int *val)
 
 static int smb_set_charge_behaviour(struct smb_chip *chip, int val)
 {
+	unsigned int bit;
+	int rc;
+
 	switch (val) {
 	case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
-		return regmap_update_bits(chip->regmap,
-					  chip->base + CHARGING_ENABLE_CMD,
-					  CHARGING_ENABLE_CMD_BIT,
-					  CHARGING_ENABLE_CMD_BIT);
+		bit = CHARGING_ENABLE_CMD_BIT;
+		break;
 	case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
-		return regmap_update_bits(chip->regmap,
-					  chip->base + CHARGING_ENABLE_CMD,
-					  CHARGING_ENABLE_CMD_BIT, 0);
+		bit = 0;
+		break;
 	default:
 		return -EINVAL;
 	}
+
+	rc = regmap_update_bits(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
+				CHARGING_ENABLE_CMD_BIT, bit);
+	if (rc < 0)
+		return rc;
+
+	/*
+	 * The charger reports no interrupt for a change it was told to make;
+	 * without this, userspace (Android's healthd) only sees the new
+	 * status at its next periodic poll, up to a minute later.
+	 */
+	power_supply_changed(chip->chg_psy);
+	if (chip->batt_psy)
+		power_supply_changed(chip->batt_psy);
+	return 0;
 }
 
 /*
