@@ -8,6 +8,7 @@
  * hardware found in pmi8998 and related PMICs.
  */
 
+#include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/cleanup.h>
 #include <linux/devm-helpers.h>
@@ -472,6 +473,20 @@
 #define QG_LAST_ADC_V_DATA0				0xc0
 #define QG_LAST_ADC_I_DATA0				0xc2
 
+/*
+ * The gauge's FIFO of mean currents, see smb_fg_fifo_charge(). It runs as the
+ * PMIC's boot sequence configures it; these are only read.
+ */
+#define QG_STATUS3					0x0a
+#define QG_COUNT_FIFO_RT_MASK				GENMASK(3, 0)
+#define QG_S2_NORMAL_MEAS_CTL2				0x51
+#define QG_FIFO_LENGTH_MASK				GENMASK(5, 3)
+#define QG_NUM_OF_ACCUM_MASK				GENMASK(2, 0)
+#define QG_S2_NORMAL_MEAS_CTL3				0x52
+#define QG_I_ACCUM_DATA0_RT				0x8b	/* 3 bytes, then the count */
+#define QG_I_FIFO0_DATA0				0xa0
+#define QG_FIFO_MAX_LENGTH				8
+
 /* Both sample registers read back as 0x8000 while they hold no measurement */
 #define QG_ADC_INVALID					0x8000
 /* nV per LSB of the voltage ADC, nA per LSB of the current ADC */
@@ -505,6 +520,13 @@
  * open-circuit voltage instead, which a rested battery reports accurately.
  */
 #define SMB_FG_STALE_MS					60000
+
+/*
+ * A poll this much later than its interval had the system suspended for some
+ * of it: count it from the gauge's FIFO, which went on measuring, rather than
+ * from the one sample taken on waking. See smb_fg_fifo_charge().
+ */
+#define SMB_FG_LATE_MS					(2 * SMB_FG_POLL_MS)
 
 /*
  * How far the persisted state of charge may sit from the gauge's own rested
@@ -1630,8 +1652,8 @@ static bool smb_fg_track_completion(struct smb_chip *chip)
  *
  * Only spans that are actually accountable are used. A span is thrown away -
  * @fg_learn_soc set to -1 - wherever charge moved without being counted, which
- * is what a suspend gap is, so a short measurement is preferred to a long one
- * with a hole in it.
+ * is what a suspend gap is when the FIFO could not account for all of it, so a
+ * short measurement is preferred to a long one with a hole in it.
  *
  * Caller holds @fg_lock.
  */
@@ -1745,6 +1767,145 @@ static irqreturn_t smb_handle_good_ocv(int irq, void *data)
 }
 
 /**
+ * smb_fg_fifo_charge() - the charge that went through the pack lately, as the
+ *			  gauge's FIFO recorded it
+ * @chip: the charger
+ * @span_ms: how far back from now to count
+ * @ua_ms: where to put the charge, in microamp-milliseconds, positive while
+ *	   charging
+ *
+ * The count runs on the CPU and stops while it is suspended, but the gauge
+ * goes on measuring the battery current all the same. Each entry of its FIFO
+ * is the mean current of one accumulation - 256 samples 300 ms apart as the
+ * PMIC's boot sequence sets it up, 76.8 s - the entries are written in turn,
+ * and the one in progress is the running sum in the real-time accumulator.
+ * Entries the current pass has not reached yet still hold the previous pass,
+ * so read newest first the FIFO is the last ten minutes or so of current,
+ * whatever the CPU did meanwhile.
+ *
+ * Counting the charge a suspend took matters: a tablet asleep at 50 mA loses a
+ * percent an hour, and a count that stands still meanwhile shows a full night
+ * of it at once, whenever the next rested reading puts it right. A span longer
+ * than the FIFO reaches is carried on at the mean of what it holds. The current
+ * of a sleeping system is steady, so that is a fair estimate, but an estimate.
+ *
+ * Return: 1 when the whole span came from the FIFO, 0 when part of it was
+ * estimated, a negative error number when the FIFO could not be read.
+ */
+static int smb_fg_fifo_charge(struct smb_chip *chip, s64 span_ms, s64 *ua_ms)
+{
+	unsigned int base = chip->var->qg_base;
+	unsigned int ctl2, ctl3, rt, rt_after = 0;
+	u8 acc[4], fifo[2 * QG_FIFO_MAX_LENGTH];
+	int len, interval_ms, entry_ms, acc_cnt, mean_ua, k, rc, tries;
+	s64 seg_ms, covered = 0, charge = 0;
+	s32 acc_sum;
+	s16 raw;
+
+	rc = regmap_read(chip->regmap, base + QG_S2_NORMAL_MEAS_CTL2, &ctl2);
+	if (rc < 0)
+		return rc;
+	rc = regmap_read(chip->regmap, base + QG_S2_NORMAL_MEAS_CTL3, &ctl3);
+	if (rc < 0)
+		return rc;
+
+	len = FIELD_GET(QG_FIFO_LENGTH_MASK, ctl2) + 1;
+	interval_ms = ctl3 * 10;
+	entry_ms = (1 << (FIELD_GET(QG_NUM_OF_ACCUM_MASK, ctl2) + 1)) * interval_ms;
+	if (!interval_ms)
+		return -ENODATA;
+
+	/*
+	 * Nothing holds the FIFO still while it is read - the downstream
+	 * driver's master hold also restarts it - so read it between two looks
+	 * at the entry count, again if an entry was completed in between.
+	 */
+	for (tries = 0; tries < 3; tries++) {
+		rc = regmap_read(chip->regmap, base + QG_STATUS3, &rt);
+		if (rc < 0)
+			return rc;
+		rc = regmap_bulk_read(chip->regmap, base + QG_I_ACCUM_DATA0_RT,
+				      acc, sizeof(acc));
+		if (rc < 0)
+			return rc;
+		rc = regmap_bulk_read(chip->regmap, base + QG_I_FIFO0_DATA0,
+				      fifo, 2 * len);
+		if (rc < 0)
+			return rc;
+		rc = regmap_read(chip->regmap, base + QG_STATUS3, &rt_after);
+		if (rc < 0)
+			return rc;
+		if (rt == rt_after)
+			break;
+	}
+	if (rt != rt_after)
+		return -EAGAIN;
+	rt = min_t(unsigned int, FIELD_GET(QG_COUNT_FIFO_RT_MASK, rt), len);
+
+	/* The entry in progress: the sum of acc_cnt samples */
+	acc_sum = sign_extend32(get_unaligned_le24(acc), 23);
+	acc_cnt = acc[3];
+	if (acc_cnt) {
+		mean_ua = -(int)div_s64((s64)acc_sum * QG_I_LSB_NA,
+					1000LL * acc_cnt);
+		seg_ms = min_t(s64, span_ms, (s64)acc_cnt * interval_ms);
+		charge += (s64)mean_ua * seg_ms;
+		covered += seg_ms;
+	}
+
+	/* Then the finished entries, newest first */
+	for (k = 1; k <= len && covered < span_ms; k++) {
+		raw = get_unaligned_le16(&fifo[2 * ((rt + len - k) % len)]);
+		if ((u16)raw == QG_ADC_INVALID)
+			break;
+		mean_ua = -(int)div_s64((s64)raw * QG_I_LSB_NA, 1000);
+		seg_ms = min_t(s64, span_ms - covered, entry_ms);
+		charge += (s64)mean_ua * seg_ms;
+		covered += seg_ms;
+	}
+
+	if (!covered)
+		return -ENODATA;
+	if (covered < span_ms)
+		charge += div_s64(charge, covered) * (span_ms - covered);
+
+	*ua_ms = charge;
+
+	return covered == span_ms;
+}
+
+/*
+ * smb_fg_count() - add counted charge to the state of charge
+ * @chip: the charger
+ * @ua_ms: the charge, in microamp-milliseconds, positive while charging
+ *
+ * Caller holds @fg_lock.
+ */
+static void smb_fg_count(struct smb_chip *chip, s64 ua_ms)
+{
+	/*
+	 * charge (uAh) = ua_ms / 3600, and one percent of the pack is
+	 * charge_full_uah / 100, so a hundredth of a percent is
+	 * 360 * charge_full_uah microamp-milliseconds.
+	 *
+	 * At a tenth of an amp over a ten-second poll that quotient is under
+	 * one, so carry the undivided remainder rather than rounding it away:
+	 * discarded it would be a standing error in the rate itself, always in
+	 * the direction of counting too little.
+	 */
+	s64 per_permyriad = 360LL * chip->charge_full_uah;
+	s64 step;
+
+	chip->fg_residue += ua_ms;
+	chip->fg_learn_ua_ms += ua_ms;
+	step = div_s64(chip->fg_residue, per_permyriad);
+	chip->fg_residue -= step * per_permyriad;
+
+	chip->soc_permyriad += step;
+	chip->soc_permyriad = clamp(chip->soc_permyriad, 0, 100 * 100);
+}
+
+/**
  * smb_fg_update() - carry the fuel gauge across one poll interval
  * @chip: the charger
  *
@@ -1757,10 +1918,10 @@ static irqreturn_t smb_handle_good_ocv(int irq, void *data)
  */
 static bool smb_fg_update(struct smb_chip *chip)
 {
-	int v_uv, i_ua, ocv_uv, soc_ocv, was;
+	int v_uv, i_ua, ocv_uv, soc_ocv, was, counted = -ENODATA;
 	bool changed = false;
 	ktime_t now = ktime_get_boottime();
-	s64 elapsed_ms;
+	s64 elapsed_ms, ua_ms = 0;
 
 	if (smb_qg_read_sample(chip, QG_LAST_ADC_V_DATA0, &v_uv, &i_ua) < 0)
 		return false;
@@ -1824,16 +1985,31 @@ static bool smb_fg_update(struct smb_chip *chip)
 		chip->soc_permyriad = soc_ocv;
 		chip->fg_residue = 0;
 		chip->fg_ready = true;
+	} else if (elapsed_ms > SMB_FG_LATE_MS &&
+		   (counted = smb_fg_fifo_charge(chip, elapsed_ms, &ua_ms)) >= 0) {
+		/*
+		 * The system was suspended for some of this interval, and the
+		 * gauge measured it while the CPU could not: count what its FIFO
+		 * recorded. When it had to be extended past what the FIFO holds,
+		 * the span in progress has an estimate in it and is no
+		 * measurement of the pack.
+		 */
+		smb_fg_count(chip, ua_ms);
+		if (!counted)
+			chip->fg_learn_soc = -1;
+		dev_dbg(chip->dev, "fg: suspend gap %lld ms, %lld uAh%s\n",
+			elapsed_ms, div_s64(ua_ms, 3600 * 1000),
+			counted ? "" : " (partly estimated)");
 	} else if (elapsed_ms > SMB_FG_STALE_MS && !chip->fg_charging) {
 		/*
-		 * A gap this long is a suspend: nothing was counted across it, and
-		 * the live sample describes only the instant of waking. A phone
-		 * busy the moment it resumes gives a loaded reading, which on the
-		 * flat curve is a large, one-directional error - so do not anchor
-		 * to it. A suspend draws too little to have moved the charge, so
-		 * keep the count as it was and let the hardware rest-OCV re-anchor
-		 * correct any residual. Only a wake sample that is itself at rest
-		 * is a real open-circuit voltage worth taking outright.
+		 * A gap this long is a suspend, and the FIFO could not be read,
+		 * so nothing was counted across it; the live sample describes
+		 * only the instant of waking. A phone busy the moment it resumes
+		 * gives a loaded reading, which on the flat curve is a large,
+		 * one-directional error - so do not anchor to it. Keep the count
+		 * as it was and let the hardware rest-OCV re-anchor correct it.
+		 * Only a wake sample that is itself at rest is a real
+		 * open-circuit voltage worth taking outright.
 		 */
 		if (abs(i_ua) <= SMB_FG_OCV_QUIET_UA)
 			chip->soc_permyriad = soc_ocv;
@@ -1848,26 +2024,7 @@ static bool smb_fg_update(struct smb_chip *chip)
 		else
 			chip->fg_learn_soc = -1;
 	} else {
-		/*
-		 * charge (uAh) = i_ua * elapsed / 3600, and one percent of the
-		 * pack is charge_full_uah / 100, so a hundredth of a
-		 * percent per millisecond is i_ua * elapsed_ms / (360 * full).
-		 *
-		 * At a tenth of an amp that quotient is under one per poll, so
-		 * carry the undivided remainder rather than rounding it away:
-		 * discarded it would be a standing error in the rate itself,
-		 * always in the direction of counting too little.
-		 */
-		s64 per_permyriad = 360LL * chip->charge_full_uah;
-		s64 step;
-
-		chip->fg_residue += (s64)i_ua * elapsed_ms;
-		chip->fg_learn_ua_ms += (s64)i_ua * elapsed_ms;
-		step = div_s64(chip->fg_residue, per_permyriad);
-		chip->fg_residue -= step * per_permyriad;
-
-		chip->soc_permyriad += step;
-		chip->soc_permyriad = clamp(chip->soc_permyriad, 0, 100 * 100);
+		smb_fg_count(chip, (s64)i_ua * elapsed_ms);
 	}
 
 	chip->fg_last = now;
