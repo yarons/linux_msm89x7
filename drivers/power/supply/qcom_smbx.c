@@ -528,6 +528,9 @@
  */
 #define SMB_FG_LATE_MS					(2 * SMB_FG_POLL_MS)
 
+/* How long a resume keeps the system up for the count, see smb_resume() */
+#define SMB_FG_RESUME_HOLD_MS				200
+
 /*
  * How far the persisted state of charge may sit from the gauge's own rested
  * capture before the measurement is preferred to it at boot, in hundredths of
@@ -3545,6 +3548,28 @@ static int smb_probe(struct platform_device *pdev)
 	return 0;
 }
 
+/*
+ * Count the suspend that just ended while the system is up. Left to the poll,
+ * the count waits for a wake that lasts ten seconds, and the wakes of a
+ * sleeping tablet last a fraction of one: the level stood still between the
+ * rare long ones, and every gap longer than the gauge's FIFO had to be
+ * estimated. The wakeup event keeps the system up for the few milliseconds the
+ * worker needs.
+ */
+static int smb_resume(struct device *dev)
+{
+	struct smb_chip *chip = dev_get_drvdata(dev);
+
+	if (chip->batt_psy && smb_fg_available(chip)) {
+		pm_wakeup_event(dev, SMB_FG_RESUME_HOLD_MS);
+		mod_delayed_work(system_wq, &chip->fg_work, 0);
+	}
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(smb_pm_ops, NULL, smb_resume);
+
 static const struct of_device_id smb_match_id_table[] = {
 	{ .compatible = "qcom,pmi8998-charger", .data = &smb_variant_pmi8998 },
 	{ .compatible = "qcom,pm660-charger", .data = &smb_variant_pm660 },
@@ -3558,6 +3583,7 @@ static struct platform_driver qcom_spmi_smb = {
 	.driver = {
 		.name = "qcom-smbx-charger",
 		.of_match_table = smb_match_id_table,
+		.pm = pm_sleep_ptr(&smb_pm_ops),
 		},
 };
 
