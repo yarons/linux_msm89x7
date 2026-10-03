@@ -1344,6 +1344,23 @@ static irqreturn_t smb_handle_usb_plugin(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/*
+ * The charger changed state on its own - charging started, stopped, finished or
+ * was resumed after a charging switch was flipped. Nothing else reports those:
+ * the switch's own setter can only announce the state it finds at once, which
+ * on the way back on is still "not charging" for a moment.
+ */
+static irqreturn_t smb_handle_chg_state_change(int irq, void *data)
+{
+	struct smb_chip *chip = data;
+
+	power_supply_changed(chip->chg_psy);
+	if (chip->batt_psy)
+		power_supply_changed(chip->batt_psy);
+
+	return IRQ_HANDLED;
+}
+
 static irqreturn_t smb_handle_usb_icl_change(int irq, void *data)
 {
 	struct smb_chip *chip = data;
@@ -3317,6 +3334,21 @@ static int smb_probe(struct platform_device *pdev)
 	rc = smb_init_irq(chip, &irq, "wdog-bark", smb_handle_wdog_bark);
 	if (rc < 0)
 		return rc;
+
+	/* Optional: without it the state is only seen at the next poll */
+	irq = platform_get_irq_byname_optional(to_platform_device(chip->dev),
+					       "chg-state-change");
+	if (irq == -EPROBE_DEFER)
+		return irq;
+	if (irq > 0) {
+		rc = devm_request_threaded_irq(chip->dev, irq, NULL,
+					       smb_handle_chg_state_change,
+					       IRQF_ONESHOT, "chg-state-change",
+					       chip);
+		if (rc < 0)
+			return dev_err_probe(chip->dev, rc,
+					     "Couldn't request chg-state-change irq\n");
+	}
 
 	/*
 	 * The gauge raises this the moment it captures a fresh rested
