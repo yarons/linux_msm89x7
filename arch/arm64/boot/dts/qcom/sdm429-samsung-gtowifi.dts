@@ -598,6 +598,10 @@
 	status = "okay";
 };
 
+&pmi632_vib {
+	status = "okay";
+};
+
 &rpm_requests {
 	regulators {
 		compatible = "qcom,rpm-pm8953-regulators";
