@@ -2604,8 +2604,8 @@ int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
 		return -ENOMEM;
 	}
 
-	refresh_period = mult_frac(refresh_period, (u64) mode->clock,
-			mode->htotal * (u64) mode->vtotal);
+	refresh_period = div64_u64(refresh_period * mode->clock,
+				   (u64)mode->htotal * mode->vtotal);
 	msm_host->vid_done_timeout = usecs_to_jiffies(refresh_period);
 
 	return 0;
